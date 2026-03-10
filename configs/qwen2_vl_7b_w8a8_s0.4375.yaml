@@ -1,0 +1,29 @@
+# Qwen2-VL-7B: JSQ v1, W8A8, 43.75% unstructured sparsity
+model: Qwen/Qwen2-VL-7B-Instruct
+
+# Calibration
+calib_dataset: coco_captions
+nsamples: 128
+seqlen: 2048
+seed: 42
+
+# Pruning
+pruning_method: jsq_v1
+sparsity_ratio: 0.4375
+sparsity_type: unstructured
+rho: 2.1
+
+# Quantization
+w_bits: 8
+a_bits: 8
+weight_quant: per_channel
+act_quant: per_token
+quantize_bmm_input: true
+
+# Smoothing
+smooth_alpha: 0.8
+
+# Evaluation
+eval_ppl: true
+tasks: mmbench_en_dev,seedbench,mme
+num_fewshot: 0
