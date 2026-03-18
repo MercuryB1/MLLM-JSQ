@@ -1,0 +1,18 @@
+# Core ML
+torch>=2.1.0
+numpy>=1.24.0
+
+# HuggingFace ecosystem
+transformers>=4.45.0
+datasets>=2.18.0
+accelerate>=0.27.0
+
+# Logging & utilities
+loguru>=0.7.0
+tqdm>=4.65.0
+
+# Optional: multimodal calibration (COCO captions)
+# Pillow>=10.0.0
+
+# Optional: MLLM evaluation
+# lmms-eval @ git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git

@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+
+# Output checkpoints
+outputs/
+
+# Datasets & cache
+storage/
+
+# uv / pip
+uv.lock
+
+# Claude project files
+.claude/
+
+# Editor
+.idea/
+.vscode/
+*.swp

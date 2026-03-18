@@ -27,9 +27,6 @@ class QuantizationPass(CompressionPass):
 
     def apply(self, block, input_feat: Dict[str, torch.Tensor], adapter, config) -> None:
         named_linears = adapter.get_named_linears(block)
-
-        # Some adapters may want to quantize BMM inputs (q/k/v output).
-        # We detect q/k projections by name convention.
         bmm_names = {"q_proj", "k_proj", "query", "key"}
 
         for name, linear in named_linears.items():

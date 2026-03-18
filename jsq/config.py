@@ -10,6 +10,7 @@ class CompressConfig:
     # Calibration
     calib_dataset: str = "pileval"   # pileval / c4 / wikitext2 / coco_captions
     nsamples: int = 128
+    calib_batch_size: int = 1        # batch size for multimodal calibration
     seqlen: int = 2048
     seed: int = 42
 
@@ -35,10 +36,14 @@ class CompressConfig:
     num_fewshot: int = 0
     limit: int = -1
 
+    # Storage
+    data_dir: str = "storage/datasets"   # local directory for calibration datasets
+
     # Other
     save_dir: Optional[str] = None
     multigpu: bool = False
     batch_size: int = 1
+    no_compress: bool = False   # skip all compression passes (for quick validation)
 
     @property
     def prune_n(self) -> int:

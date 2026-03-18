@@ -10,9 +10,6 @@ from .base import CompressionPass
 from jsq.quant.ops import quantize_weight_per_tensor_absmax
 
 
-# ---------------------------------------------------------------------------
-# Core clip logic
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def _clip_layer(
@@ -84,9 +81,6 @@ def _apply_clip(module: nn.Module, clip_list: List[Tuple[str, torch.Tensor]]) ->
         layer.weight.data = w.reshape(org_shape)
 
 
-# ---------------------------------------------------------------------------
-# CompressionPass implementation
-# ---------------------------------------------------------------------------
 
 class ClippingPass(CompressionPass):
     """Search for optimal weight clip thresholds and apply them."""

@@ -1,0 +1,40 @@
+[project]
+name = "mllm-jsq"
+version = "0.1.0"
+description = "Joint Sparsity & Quantization compression framework for LLMs and MLLMs"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1.0",
+    "numpy>=1.24.0",
+    "transformers>=4.45.0",
+    "datasets>=2.18.0",
+    "accelerate>=0.27.0",
+    "loguru>=0.7.0",
+    "tqdm>=4.65.0",
+]
+
+[project.optional-dependencies]
+multimodal = [
+    "Pillow>=10.0.0",
+]
+eval = [
+    "lmms-eval @ git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cuda" }
+
+[[tool.uv.index]]
+name = "pytorch-cuda"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["jsq"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

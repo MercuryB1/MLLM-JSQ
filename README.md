@@ -25,14 +25,49 @@ Supports **JSQ / WANDA pruning** combined with **W8A8 quantization** in a unifie
 | LLaMA / LLaMA-2 | `llama` | Text-only LLM |
 | Qwen2 | `qwen2` | Text-only LLM |
 | Qwen2-VL | `qwen2_vl` | MLLM, compresses LLM decoder only |
+| Qwen2.5-VL | `qwen2_5_vl` | MLLM, compresses LLM decoder only |
+| Qwen3-VL | `qwen3_vl` | MLLM, compresses LLM decoder only |
 
 ---
 
-## Installation
+## Environment Setup
+
+### 1. Create a conda environment with Python 3.10
 
 ```bash
-pip install torch transformers accelerate loguru datasets
-pip install lmms-eval   # optional, for multimodal evaluation
+conda create -n mllm-jsq python=3.10 -y
+conda activate mllm-jsq
+```
+
+### 2. Install uv
+
+```bash
+pip install uv
+```
+
+### 3. Install dependencies (including PyTorch CUDA)
+
+```bash
+uv sync
+```
+
+This installs PyTorch from the PyTorch CUDA 12.1 index automatically (configured in `pyproject.toml`). To use a different CUDA version, update the index URL in `[tool.uv.index]` before syncing.
+
+### 4. Install lmms-eval for multimodal evaluation
+
+Required when using `--tasks` (e.g. `mmbench_en_dev`, `seedbench`, `mme`).
+lmms-eval is managed as a local package under `third_party/`:
+
+```bash
+git clone https://github.com/EvolvingLMMs-Lab/lmms-eval.git third_party/lmms-eval
+uv pip install -e third_party/lmms-eval
+```
+
+### 5. Verify the setup
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+python main.py --help
 ```
 
 ---
@@ -51,18 +86,17 @@ python main.py \
   --save_dir ./outputs/qwen2-7b-compressed
 ```
 
-### Multimodal LLM (Qwen2-VL) with multimodal calibration
+### Multimodal LLM (Qwen2.5-VL / Qwen3-VL) with multimodal calibration
 
 ```bash
 python main.py \
-  --model Qwen/Qwen2-VL-7B-Instruct \
-  --calib_dataset coco_captions \
+  --model Qwen/Qwen2.5-VL-7B-Instruct \
+  --calib_dataset gqa \
   --pruning_method jsq_v1 \
   --sparsity_ratio 0.4375 \
   --w_bits 8 --a_bits 8 \
-  --eval_ppl \
   --tasks mmbench_en_dev,seedbench,mme \
-  --save_dir ./outputs/qwen2vl-7b-compressed
+  --save_dir ./outputs/qwen2.5vl-7b-compressed
 ```
 
 ### Using provided scripts
@@ -71,8 +105,12 @@ python main.py \
 # Text-only LLM
 bash scripts/compress_llm.sh Qwen/Qwen2-7B-Instruct ./outputs/qwen2-7b
 
-# Qwen2-VL
-bash scripts/compress_qwen2vl.sh Qwen/Qwen2-VL-7B-Instruct ./outputs/qwen2vl-7b
+# Qwen2.5-VL（默认），压缩后自动评测
+bash scripts/compress_qwen2vl.sh
+
+# 指定模型和评测任务
+bash scripts/compress_qwen2vl.sh Qwen/Qwen2.5-VL-7B-Instruct ./outputs/qwen2.5vl-7b mme,mmbench_en_dev
+bash scripts/compress_qwen2vl.sh Qwen/Qwen3-VL-7B-Instruct   ./outputs/qwen3vl-7b   mme,mmbench_en_dev
 ```
 
 ---
@@ -153,7 +191,9 @@ mllm-jsq/
 │   │   ├── registry.py            # @register_adapter + get_adapter()
 │   │   ├── llama.py               # LlamaAdapter
 │   │   ├── qwen2.py               # Qwen2Adapter
-│   │   └── qwen2_vl.py            # Qwen2VLAdapter (MLLM)
+│   │   ├── qwen2_vl.py            # Qwen2VLAdapter (MLLM)
+│   │   ├── qwen2_5_vl.py          # Qwen2_5_VLAdapter (MLLM)
+│   │   └── qwen3_vl.py            # Qwen3VLAdapter (MLLM)
 │   ├── compression/
 │   │   ├── pipeline.py            # CompressionPipeline: drives per-layer loop
 │   │   ├── collector.py           # Feature collection via forward hooks

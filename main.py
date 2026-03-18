@@ -2,7 +2,7 @@
 import argparse
 
 from jsq.config import CompressConfig
-from run import run
+from run import run, run_eval
 
 
 def parse_args() -> CompressConfig:
@@ -15,13 +15,17 @@ def parse_args() -> CompressConfig:
                         help="Model name or local path (HuggingFace format)")
     parser.add_argument("--save_dir", type=str, default=None,
                         help="Directory to save the compressed model")
+    parser.add_argument("--data_dir", type=str, default="storage/datasets",
+                        help="Local directory to store/load calibration datasets")
 
     # Calibration
     parser.add_argument("--calib_dataset", type=str, default="pileval",
-                        choices=["pileval", "c4", "wikitext2", "coco_captions", "sharegpt4v"],
+                        choices=["pileval", "c4", "wikitext2", "coco_captions", "sharegpt4v", "gqa"],
                         help="Calibration dataset (use coco_captions/sharegpt4v for MLLMs)")
     parser.add_argument("--nsamples", type=int, default=128,
                         help="Number of calibration samples")
+    parser.add_argument("--calib_batch_size", type=int, default=1,
+                        help="Batch size for multimodal calibration (samples per forward pass)")
     parser.add_argument("--seqlen", type=int, default=2048,
                         help="Sequence length for text calibration")
     parser.add_argument("--seed", type=int, default=42)
@@ -51,6 +55,8 @@ def parse_args() -> CompressConfig:
     parser.add_argument("--smooth_alpha", type=float, default=0.8)
 
     # Evaluation
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Skip compression; load a saved model from --save_dir and evaluate")
     parser.add_argument("--eval_ppl", action="store_true",
                         help="Evaluate WikiText-2 perplexity after compression")
     parser.add_argument("--tasks", type=str, default=None,
@@ -60,14 +66,18 @@ def parse_args() -> CompressConfig:
     parser.add_argument("--limit", type=int, default=-1,
                         help="Limit eval samples per task (-1 = no limit)")
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--no_compress", action="store_true",
+                        help="Skip all compression passes (for quick validation)")
 
     args = parser.parse_args()
 
-    return CompressConfig(
+    return args.eval_only, CompressConfig(
         model=args.model,
         save_dir=args.save_dir,
+        data_dir=args.data_dir,
         calib_dataset=args.calib_dataset,
         nsamples=args.nsamples,
+        calib_batch_size=args.calib_batch_size,
         seqlen=args.seqlen,
         seed=args.seed,
         pruning_method=args.pruning_method,
@@ -85,9 +95,13 @@ def parse_args() -> CompressConfig:
         num_fewshot=args.num_fewshot,
         limit=args.limit,
         batch_size=args.batch_size,
+        no_compress=args.no_compress,
     )
 
 
 if __name__ == "__main__":
-    config = parse_args()
-    run(config)
+    eval_only, config = parse_args()
+    if eval_only:
+        run_eval(config)
+    else:
+        run(config)

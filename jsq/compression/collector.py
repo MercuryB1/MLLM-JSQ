@@ -1,7 +1,7 @@
 """Utilities for collecting layer inputs during calibration."""
 import functools
 from collections import defaultdict
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,13 +19,21 @@ class Catcher(nn.Module):
         self.module = module
         self.captured: List[Tuple[torch.Tensor, Dict]] = []
 
+    def __getattr__(self, name: str):
+        # Proxy attribute access so model code (e.g. Qwen2VL accessing
+        # decoder_layer.attention_type) still works.
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.module, name)
+
     def forward(self, inp, **kwargs):
         kw = {
-            k: v.detach().cpu() if isinstance(v, torch.Tensor) else v
+            k: v.detach() if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
         kw["use_cache"] = False
-        self.captured.append((inp.detach().cpu(), kw))
+        self.captured.append((inp.detach(), kw))
         raise ValueError("catcher_exit")
 
 
@@ -62,26 +70,21 @@ def collect_first_layer_inputs(
     """
     is_multimodal = not isinstance(calib_samples, torch.Tensor)
 
-    # Wrap blocks[0] in Catcher
     catcher = Catcher(blocks[0])
     blocks[0] = catcher
     blocks[0].to(device)
     adapter.move_llm_embed(model, device)
 
     if is_multimodal:
-        # Move vision encoder to device for the calibration forward passes,
-        # then return it to CPU to free memory for the compression loop.
         adapter.move_vision_encoder(model, device)
 
     if not is_multimodal:
-        # Text: single batched forward
         try:
             adapter.run_forward_for_calibration(model, calib_samples.to(device))
         except ValueError as e:
             if "catcher_exit" not in str(e):
                 raise
     else:
-        # Multimodal: one forward per sample
         for sample in calib_samples:
             try:
                 adapter.run_forward_for_calibration(model, sample)
@@ -89,7 +92,6 @@ def collect_first_layer_inputs(
                 if "catcher_exit" not in str(e):
                     raise
 
-    # Unwrap Catcher, restore device state
     blocks[0] = catcher.module
     adapter.move_llm_embed(model, "cpu")
     if is_multimodal:
@@ -104,14 +106,63 @@ def collect_first_layer_inputs(
         )
 
     if not is_multimodal:
-        # Single capture → batched Tensor + shared kwargs
         inps, layer_kwargs = catcher.captured[0]
         return inps, layer_kwargs
     else:
-        # Multiple captures → list of per-sample tensors + list of per-sample kwargs
         inps_list = [c[0] for c in catcher.captured]
         kwargs_list = [c[1] for c in catcher.captured]
         return inps_list, kwargs_list
+
+
+@torch.no_grad()
+def collect_block_input_feat_and_output(
+    block: nn.Module,
+    inps,
+    layer_kwargs,
+):
+    """Collect input features and run the block in a single forward pass.
+
+    Returns (input_feat, next_inps, next_layer_kwargs).
+    """
+    named_linears = {
+        name: m for name, m in block.named_modules() if isinstance(m, nn.Linear)
+    }
+    feat: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+    def _hook_batched(m, x, y, name):
+        feat[name].append(x[0].detach())
+
+    def _hook_flatten(m, x, y, name):
+        act = x[0].detach()
+        feat[name].append(act.reshape(-1, act.shape[-1]))
+
+    device = next(block.parameters()).device
+
+    if isinstance(inps, torch.Tensor):
+        handles = [
+            mod.register_forward_hook(functools.partial(_hook_batched, name=name))
+            for name, mod in named_linears.items()
+        ]
+        out = block(inps.to(device), **_to_device(layer_kwargs, device))[0]
+        for h in handles:
+            h.remove()
+        input_feat = {k: torch.cat(v, dim=0) for k, v in feat.items()}
+        return input_feat, out, layer_kwargs
+
+    else:
+        handles = [
+            mod.register_forward_hook(functools.partial(_hook_flatten, name=name))
+            for name, mod in named_linears.items()
+        ]
+        outputs = []
+        for inp, kw in zip(inps, layer_kwargs):
+            out = block(inp.to(device), **_to_device(kw, device))[0]
+            outputs.append(out)
+        for h in handles:
+            h.remove()
+        input_feat: Dict = {k: torch.cat(v, dim=0) for k, v in feat.items()}
+        input_feat["__nsamples__"] = len(inps)
+        return input_feat, outputs, layer_kwargs
 
 
 @torch.no_grad()
@@ -122,16 +173,9 @@ def collect_block_input_feat(
 ) -> Dict[str, torch.Tensor]:
     """Collect input activations for every Linear layer inside a block.
 
-    Text mode   (inps: Tensor[n, s, h], layer_kwargs: Dict):
-        One batched forward; features have shape [n, s, hidden_in].
-
-    Multimodal mode (inps: List[Tensor[1, s_i, h]], layer_kwargs: List[Dict]):
-        One forward per sample; features are flattened to [total_tokens, hidden_in]
-        and the entry "__nsamples__" is set to the sample count.
-
-    Returns:
-        Dict mapping linear name -> feature Tensor.
-        For multimodal, also contains "__nsamples__" (int key).
+    Text mode (inps: Tensor[n, s, h]): one batched forward, features shape [n, s, hidden_in].
+    Multimodal mode (inps: List[Tensor]): one forward per sample, features flattened to
+    [total_tokens, hidden_in]; also sets "__nsamples__" in the returned dict.
     """
     named_linears = {
         name: m for name, m in block.named_modules() if isinstance(m, nn.Linear)
@@ -140,17 +184,15 @@ def collect_block_input_feat(
     feat: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
     def _hook_batched(m, x, y, name):
-        feat[name].append(x[0].detach().cpu())
+        feat[name].append(x[0].detach())
 
     def _hook_flatten(m, x, y, name):
-        # Flatten to 2D so variable-length sequences can be concatenated
-        act = x[0].detach().cpu()
+        act = x[0].detach()
         feat[name].append(act.reshape(-1, act.shape[-1]))
 
     device = next(block.parameters()).device
 
     if isinstance(inps, torch.Tensor):
-        # ---- Text mode: one batched forward ----
         handles = [
             mod.register_forward_hook(functools.partial(_hook_batched, name=name))
             for name, mod in named_linears.items()
@@ -161,7 +203,6 @@ def collect_block_input_feat(
         return {k: torch.cat(v, dim=0) for k, v in feat.items()}
 
     else:
-        # ---- Multimodal mode: iterate per sample ----
         handles = [
             mod.register_forward_hook(functools.partial(_hook_flatten, name=name))
             for name, mod in named_linears.items()
@@ -191,10 +232,10 @@ def run_block(
 
     if isinstance(inps, torch.Tensor):
         out = block(inps.to(device), **_to_device(layer_kwargs, device))[0]
-        return out.cpu(), layer_kwargs
+        return out, layer_kwargs
     else:
         outputs = [
-            block(inp.to(device), **_to_device(kw, device))[0].cpu()
+            block(inp.to(device), **_to_device(kw, device))[0]
             for inp, kw in zip(inps, layer_kwargs)
         ]
         return outputs, layer_kwargs

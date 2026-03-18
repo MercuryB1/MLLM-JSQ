@@ -8,9 +8,6 @@ from loguru import logger
 from .base import CompressionPass
 
 
-# ---------------------------------------------------------------------------
-# Core smooth functions (pure, work on any norm+linear pair)
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def smooth_ln_fcs_rms(
@@ -36,7 +33,6 @@ def smooth_ln_fcs_rms(
         .to(device=device, dtype=dtype)
     )
 
-    # RMSNorm has only weight, no bias
     ln.weight.div_(scales)
 
     for fc in fcs:
@@ -82,9 +78,6 @@ def _get_act_scale(feat: torch.Tensor) -> torch.Tensor:
     return feat.abs().max(dim=0)[0].float()
 
 
-# ---------------------------------------------------------------------------
-# CompressionPass implementation
-# ---------------------------------------------------------------------------
 
 class SmoothingPass(CompressionPass):
     """Smooth activations to improve quantization-friendliness.

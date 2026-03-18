@@ -4,7 +4,7 @@ import random
 import numpy as np
 import torch
 from loguru import logger
-from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
 
 from jsq.config import CompressConfig
 from jsq.models.registry import get_adapter
@@ -19,9 +19,10 @@ from jsq.compression.passes.prune import PruningPass
 from jsq.compression.passes.smooth import SmoothingPass
 from jsq.compression.passes.clip import ClippingPass
 from jsq.compression.passes.quantize import QuantizationPass
+from jsq.quant.save_load import save_compressed, load_compressed
 
 
-_MULTIMODAL_TYPES = {"qwen2_vl"}
+_MULTIMODAL_TYPES = {"qwen2_vl", "qwen2_5_vl"}
 
 
 def seed_everything(seed: int) -> None:
@@ -48,7 +49,8 @@ def load_model(config: CompressConfig):
 
     logger.info(f"Loading model: {config.model} (type={model_type}, mllm={is_mllm})")
 
-    model = AutoModelForCausalLM.from_pretrained(
+    model_cls = AutoModelForImageTextToText if is_mllm else AutoModelForCausalLM
+    model = model_cls.from_pretrained(
         config.model,
         config=model_cfg,
         torch_dtype=torch.float16,
@@ -69,7 +71,7 @@ def load_model(config: CompressConfig):
 
 def load_calib_data(config: CompressConfig, processor_or_tokenizer, model_type: str):
     """Load calibration data appropriate for the model type."""
-    mm_datasets = {"coco_captions", "sharegpt4v"}
+    mm_datasets = {"coco_captions", "sharegpt4v", "gqa"}
 
     if config.calib_dataset in mm_datasets:
         if model_type not in _MULTIMODAL_TYPES:
@@ -84,6 +86,8 @@ def load_calib_data(config: CompressConfig, processor_or_tokenizer, model_type: 
             model_type=model_type,
             n_samples=config.nsamples,
             seed=config.seed,
+            data_dir=config.data_dir,
+            batch_size=config.calib_batch_size,
         )
     else:
         from jsq.calibration.text import get_text_calib_data
@@ -98,6 +102,9 @@ def load_calib_data(config: CompressConfig, processor_or_tokenizer, model_type: 
 
 def build_passes(config: CompressConfig):
     """Build the ordered list of compression passes."""
+    if config.no_compress:
+        return []
+
     passes = []
 
     if config.pruning_method != "none" and config.sparsity_ratio > 0.0:
@@ -125,41 +132,64 @@ def check_sparsity(model, adapter) -> float:
     return sparsity
 
 
+def run_eval(config: CompressConfig) -> None:
+    """Load a saved compressed model and evaluate it with lmms-eval."""
+    seed_everything(config.seed)
+
+    if not config.save_dir:
+        raise ValueError("--save_dir must point to a compressed model directory for --eval_only")
+
+    logger.info(f"Loading compressed model from {config.save_dir} for evaluation")
+    model, processor = load_compressed(config.save_dir)
+    model_type = getattr(model.config, "model_type", "")
+
+    model.cuda()
+
+    if config.eval_ppl:
+        tokenizer = processor if model_type not in _MULTIMODAL_TYPES else \
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        from jsq.eval.ppl import eval_ppl
+        eval_ppl(model, tokenizer, seq_len=config.seqlen)
+
+    if config.tasks:
+        if model_type in _MULTIMODAL_TYPES:
+            from jsq.eval.lmms_eval import run_lmms_eval
+            run_lmms_eval(
+                model=model,
+                processor=processor,
+                tasks=config.tasks,
+                num_fewshot=config.num_fewshot,
+                batch_size=config.batch_size,
+                limit=None if config.limit == -1 else config.limit,
+            )
+        else:
+            logger.warning("lmms-eval tasks specified but model is text-only.")
+
+
 def run(config: CompressConfig) -> None:
     seed_everything(config.seed)
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    # ------------------------------------------------------------------ #
-    # 1. Load model
-    # ------------------------------------------------------------------ #
     model, processor = load_model(config)
     model_type = getattr(model.config, "model_type", "")
     adapter = get_adapter(model)
 
-    # ------------------------------------------------------------------ #
-    # 2. Load calibration data
-    # ------------------------------------------------------------------ #
-    calib_data = load_calib_data(config, processor, model_type)
-
-    # ------------------------------------------------------------------ #
-    # 3. Compress
-    # ------------------------------------------------------------------ #
     passes = build_passes(config)
-    pipeline = CompressionPipeline(passes=passes, adapter=adapter)
-    pipeline.run(model, calib_data, config, device)
+    if passes:
+        calib_data = load_calib_data(config, processor, model_type)
+    else:
+        calib_data = None
+        logger.info("No compression passes enabled — skipping calibration data loading.")
 
-    # ------------------------------------------------------------------ #
-    # 4. Sparsity check
-    # ------------------------------------------------------------------ #
+    if passes:
+        pipeline = CompressionPipeline(passes=passes, adapter=adapter)
+        pipeline.run(model, calib_data, config, device)
+
     check_sparsity(model, adapter)
 
-    # ------------------------------------------------------------------ #
-    # 5. Evaluate
-    # ------------------------------------------------------------------ #
     if config.eval_ppl:
-        # PPL only makes sense for text-mode evaluation
-        tokenizer = processor if not model_type in _MULTIMODAL_TYPES else \
+        tokenizer = processor if model_type not in _MULTIMODAL_TYPES else \
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         model.cuda()
         from jsq.eval.ppl import eval_ppl
@@ -177,16 +207,7 @@ def run(config: CompressConfig) -> None:
                 limit=None if config.limit == -1 else config.limit,
             )
         else:
-            logger.warning(
-                "lmms-eval tasks specified but model is text-only. "
-                "Use lm-eval instead (not implemented in this script)."
-            )
+            logger.warning("lmms-eval tasks specified but model is text-only.")
 
-    # ------------------------------------------------------------------ #
-    # 6. Save
-    # ------------------------------------------------------------------ #
     if config.save_dir:
-        logger.info(f"Saving model to {config.save_dir}")
-        model.save_pretrained(config.save_dir)
-        processor.save_pretrained(config.save_dir)
-        logger.info("Saved.")
+        save_compressed(model, processor, config.save_dir)
