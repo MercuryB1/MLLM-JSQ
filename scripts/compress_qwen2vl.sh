@@ -2,7 +2,7 @@
 # Compress Qwen2/2.5/3-VL: JSQ v1, 43.75% sparsity, W8A8
 # Then evaluate on MMBench and SEED-Bench.
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=4
 
 set -e
 

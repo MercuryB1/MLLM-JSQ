@@ -10,9 +10,11 @@ from jsq.config import CompressConfig
 from jsq.models.registry import get_adapter
 
 # Register all adapters by importing them
-import jsq.models.llama      # noqa: F401
-import jsq.models.qwen2      # noqa: F401
-import jsq.models.qwen2_vl   # noqa: F401
+import jsq.models.llama        # noqa: F401
+import jsq.models.qwen2        # noqa: F401
+import jsq.models.qwen2_vl     # noqa: F401
+import jsq.models.qwen2_5_vl   # noqa: F401
+import jsq.models.qwen3_vl     # noqa: F401
 
 from jsq.compression.pipeline import CompressionPipeline
 from jsq.compression.passes.prune import PruningPass
@@ -22,7 +24,7 @@ from jsq.compression.passes.quantize import QuantizationPass
 from jsq.quant.save_load import save_compressed, load_compressed
 
 
-_MULTIMODAL_TYPES = {"qwen2_vl", "qwen2_5_vl"}
+_MULTIMODAL_TYPES = {"qwen2_vl", "qwen2_5_vl", "qwen3_vl"}
 
 
 def seed_everything(seed: int) -> None:
@@ -197,6 +199,7 @@ def run(config: CompressConfig) -> None:
 
     if config.tasks:
         if model_type in _MULTIMODAL_TYPES:
+            model.cuda()
             from jsq.eval.lmms_eval import run_lmms_eval
             run_lmms_eval(
                 model=model,
