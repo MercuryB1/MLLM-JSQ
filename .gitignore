@@ -12,6 +12,9 @@ outputs/
 # Datasets & cache
 storage/
 
+# Third-party dependencies (clone manually, see README)
+third_party/
+
 # uv / pip
 uv.lock
 
