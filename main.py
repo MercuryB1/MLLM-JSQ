@@ -5,13 +5,27 @@ from jsq.config import CompressConfig
 from run import run, run_eval
 
 
+def _load_yaml(path: str) -> dict:
+    import yaml
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    # yaml uses quantize_bmm_input; argparse uses no_quantize_bmm_input — normalise here
+    if "quantize_bmm_input" in data:
+        data["no_quantize_bmm_input"] = not data.pop("quantize_bmm_input")
+    return data
+
+
 def parse_args() -> CompressConfig:
     parser = argparse.ArgumentParser(
         description="mllm-jsq: Joint Sparsity & Quantization for LLMs and MLLMs"
     )
 
+    # Config file (loaded first; CLI args override)
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to a YAML config file (CLI args take precedence)")
+
     # Model
-    parser.add_argument("--model", type=str, required=True,
+    parser.add_argument("--model", type=str, default=None,
                         help="Model name or local path (HuggingFace format)")
     parser.add_argument("--save_dir", type=str, default=None,
                         help="Directory to save the compressed model")
@@ -69,7 +83,15 @@ def parse_args() -> CompressConfig:
     parser.add_argument("--no_compress", action="store_true",
                         help="Skip all compression passes (for quick validation)")
 
+    # Two-pass parse: first grab --config, then inject yaml defaults, then re-parse
+    pre, _ = parser.parse_known_args()
+    if pre.config:
+        parser.set_defaults(**_load_yaml(pre.config))
+
     args = parser.parse_args()
+
+    if args.model is None:
+        parser.error("--model is required (either via CLI or --config)")
 
     return args.eval_only, CompressConfig(
         model=args.model,
