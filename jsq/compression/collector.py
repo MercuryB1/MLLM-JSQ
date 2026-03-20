@@ -39,10 +39,47 @@ class Catcher(nn.Module):
 
 def _to_device(kwargs: Dict, device) -> Dict:
     """Move all Tensor values in a kwargs dict to device."""
-    return {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
-        for k, v in kwargs.items()
-    }
+    result = {}
+    for k, v in kwargs.items():
+        if isinstance(v, torch.Tensor):
+            result[k] = v.to(device)
+        elif isinstance(v, tuple) and all(isinstance(t, torch.Tensor) for t in v):
+            result[k] = tuple(t.to(device) for t in v)
+        else:
+            result[k] = v
+    return result
+
+
+def _slice_kw_for_sample(kwargs: Dict, idx: int, batch_size: int) -> Dict:
+    """Extract kwargs for a single sample index from a batched kwargs dict.
+
+    Handles:
+      - torch.Tensor [batch, ...]        → [1, ...]
+      - tuple of tensors (e.g. position_embeddings = (cos, sin))
+        where each tensor has batch as dim 0 → tuple of [1, ...]
+      - scalars / non-tensor values      → passed through unchanged
+    """
+    result: Dict = {}
+    for k, v in kwargs.items():
+        if isinstance(v, tuple) and v and all(isinstance(t, torch.Tensor) for t in v):
+            sliced = []
+            for t in v:
+                if t.shape[0] == batch_size:
+                    sliced.append(t[idx: idx + 1])
+                elif t.dim() >= 2 and t.shape[1] == batch_size:
+                    sliced.append(t[:, idx: idx + 1])
+                else:
+                    sliced.append(t)
+            result[k] = tuple(sliced)
+        elif not isinstance(v, torch.Tensor) or v.dim() == 0:
+            result[k] = v
+        elif v.shape[0] == batch_size:
+            result[k] = v[idx: idx + 1]
+        elif v.dim() >= 2 and v.shape[1] == batch_size:
+            result[k] = v[:, idx: idx + 1]
+        else:
+            result[k] = v
+    return result
 
 
 @torch.no_grad()
@@ -143,11 +180,20 @@ def collect_block_input_feat_and_output(
             mod.register_forward_hook(functools.partial(_hook_batched, name=name))
             for name, mod in named_linears.items()
         ]
-        out = block(inps.to(device), **_to_device(layer_kwargs, device))[0]
+        batch_size = inps.shape[0]
+        outputs = []
+        for i in range(batch_size):
+            inp_i = inps[i: i + 1].to(device)
+            kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
+            kw_i["past_key_values"] = None
+            kw_i["use_cache"] = False
+            out_i = block(inp_i, **_to_device(kw_i, device))[0]
+            outputs.append(out_i.detach().cpu())
         for h in handles:
             h.remove()
         input_feat = {k: torch.cat(v, dim=0) for k, v in feat.items()}
-        return input_feat, out, layer_kwargs
+        next_inps = torch.cat(outputs, dim=0)
+        return input_feat, next_inps, layer_kwargs
 
     else:
         handles = [
@@ -197,7 +243,13 @@ def collect_block_input_feat(
             mod.register_forward_hook(functools.partial(_hook_batched, name=name))
             for name, mod in named_linears.items()
         ]
-        block(inps.to(device), **_to_device(layer_kwargs, device))
+        batch_size = inps.shape[0]
+        for i in range(batch_size):
+            inp_i = inps[i: i + 1].to(device)
+            kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
+            kw_i["past_key_values"] = None
+            kw_i["use_cache"] = False
+            block(inp_i, **_to_device(kw_i, device))
         for h in handles:
             h.remove()
         return {k: torch.cat(v, dim=0) for k, v in feat.items()}
@@ -231,8 +283,16 @@ def run_block(
     device = next(block.parameters()).device
 
     if isinstance(inps, torch.Tensor):
-        out = block(inps.to(device), **_to_device(layer_kwargs, device))[0]
-        return out, layer_kwargs
+        batch_size = inps.shape[0]
+        outputs = []
+        for i in range(batch_size):
+            inp_i = inps[i: i + 1].to(device)
+            kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
+            kw_i["past_key_values"] = None
+            kw_i["use_cache"] = False
+            out_i = block(inp_i, **_to_device(kw_i, device))[0]
+            outputs.append(out_i.detach().cpu())
+        return torch.cat(outputs, dim=0), layer_kwargs
     else:
         outputs = [
             block(inp.to(device), **_to_device(kw, device))[0]

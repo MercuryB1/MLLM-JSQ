@@ -68,6 +68,15 @@ def parse_args() -> CompressConfig:
     # Smoothing
     parser.add_argument("--smooth_alpha", type=float, default=0.8)
 
+    # MA-JSQ block search
+    parser.add_argument("--gamma", type=float, default=1.0,
+                        help="Modal balance factor γ: weight for text-token error "
+                             "vs vision-token error in the block reconstruction loss "
+                             "(MA-JSQ; 1.0 = equal weight)")
+    parser.add_argument("--n_search_candidates", type=int, default=8,
+                        help="Number of per-layer sparsity configs to evaluate per block "
+                             "(MA-JSQ block search)")
+
     # Evaluation
     parser.add_argument("--eval_only", action="store_true",
                         help="Skip compression; load a saved model from --save_dir and evaluate")
@@ -112,6 +121,8 @@ def parse_args() -> CompressConfig:
         act_quant=args.act_quant,
         quantize_bmm_input=not args.no_quantize_bmm_input,
         smooth_alpha=args.smooth_alpha,
+        gamma=args.gamma,
+        n_search_candidates=args.n_search_candidates,
         eval_ppl=args.eval_ppl,
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,

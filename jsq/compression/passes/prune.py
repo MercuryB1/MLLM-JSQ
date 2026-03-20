@@ -1,5 +1,5 @@
 """Pruning pass: JSQ v1/v2, WANDA, and Magnitude."""
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -112,10 +112,26 @@ def _apply_mask(w: torch.Tensor, metric: torch.Tensor, sparsity_ratio: float,
 
 
 class PruningPass(CompressionPass):
-    """Prune weights in every Linear layer of the block."""
+    """Prune weights in every Linear layer of the block.
 
-    def apply(self, block, input_feat: Dict[str, torch.Tensor], adapter, config) -> None:
-        if config.sparsity_ratio == 0.0 and config.prune_n == 0:
+    Supports an optional *per_layer_sparsity* dict that maps layer name to a
+    specific sparsity ratio, enabling block-level search (MA-JSQ).  When the
+    dict is supplied, each layer uses its own ratio instead of the global
+    ``config.sparsity_ratio``.  Layers absent from the dict fall back to the
+    global value.
+    """
+
+    _supports_per_layer = True
+
+    def apply(
+        self,
+        block,
+        input_feat: Dict[str, torch.Tensor],
+        adapter,
+        config,
+        per_layer_sparsity: Optional[Dict[str, float]] = None,
+    ) -> None:
+        if config.sparsity_ratio == 0.0 and config.prune_n == 0 and not per_layer_sparsity:
             return
 
         named_linears = adapter.get_named_linears(block)
@@ -123,6 +139,15 @@ class PruningPass(CompressionPass):
         for name, linear in named_linears.items():
             if name not in input_feat:
                 logger.warning(f"PruningPass: no input_feat for '{name}', skipping")
+                continue
+
+            # Resolve per-layer or global sparsity ratio
+            if per_layer_sparsity is not None:
+                layer_sparsity = per_layer_sparsity.get(name, config.sparsity_ratio)
+            else:
+                layer_sparsity = config.sparsity_ratio
+
+            if layer_sparsity == 0.0 and config.prune_n == 0:
                 continue
 
             w = linear.weight
@@ -151,5 +176,5 @@ class PruningPass(CompressionPass):
 
             _apply_mask(
                 w.data, metric,
-                config.sparsity_ratio, config.prune_n, config.prune_m,
+                layer_sparsity, config.prune_n, config.prune_m,
             )

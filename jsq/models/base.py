@@ -1,6 +1,6 @@
 """Abstract base class for model adapters."""
 from abc import ABC, abstractmethod
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,6 +47,19 @@ class ModelAdapter(ABC):
 
         Default implementation is a no-op (text-only LLMs have no ViT).
         MLLM adapters should override this."""
+
+    def get_vision_token_mask(
+        self, calib_samples, processor=None
+    ) -> Optional[List[torch.Tensor]]:
+        """Return per-sample boolean masks marking vision token positions.
+
+        Each element in the returned list is a 1-D BoolTensor of shape [seq_len_i]
+        where True = vision token (image_pad), False = text token.
+
+        Returns None for text-only models (default) or when calib_samples is
+        not a multimodal list.  MLLM adapters should override this.
+        """
+        return None
 
     def run_forward_for_calibration(
         self, model: nn.Module, samples, **kwargs

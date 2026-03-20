@@ -39,6 +39,10 @@ class CompressConfig:
     # Storage
     data_dir: str = "storage/datasets"   # local directory for calibration datasets
 
+    # MA-JSQ block search
+    gamma: float = 1.0              # modal balance factor (vision vs text error weight)
+    n_search_candidates: int = 8    # number of per-layer sparsity configs to evaluate
+
     # Other
     save_dir: Optional[str] = None
     multigpu: bool = False

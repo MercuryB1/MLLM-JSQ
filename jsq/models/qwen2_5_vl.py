@@ -8,7 +8,7 @@ Architecture (transformers >= 5.x):
     model.model.language_model.norm
     model.lm_head
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -46,9 +46,38 @@ class Qwen2_5_VLAdapter(ModelAdapter):
              [mlp.gate_proj, mlp.up_proj]),
         ]
 
+    def get_vision_token_mask(
+        self, calib_samples, processor=None
+    ) -> Optional[List[torch.Tensor]]:
+        """Extract per-sample vision token masks from <|image_pad|> positions."""
+        if not isinstance(calib_samples, list):
+            return None
+
+        image_pad_id = 151655  # <|image_pad|> shared with Qwen2-VL
+        if processor is not None:
+            tok = getattr(processor, "tokenizer", processor)
+            _id = tok.convert_tokens_to_ids("<|image_pad|>")
+            if _id not in (None, tok.unk_token_id):
+                image_pad_id = _id
+
+        masks: List[torch.Tensor] = []
+        for sample in calib_samples:
+            if not isinstance(sample, dict) or "input_ids" not in sample:
+                masks.append(None)
+                continue
+            ids = sample["input_ids"]
+            if isinstance(ids, torch.Tensor):
+                mask = ids.squeeze(0) == image_pad_id
+            else:
+                mask = torch.tensor([x == image_pad_id for x in ids], dtype=torch.bool)
+            masks.append(mask)
+
+        return masks if any(m is not None for m in masks) else None
+
     def run_forward_for_calibration(self, model: nn.Module, samples, **kwargs):
         if isinstance(samples, dict):
-            return model(**{k: v.to(next(model.parameters()).device)
-                            if isinstance(v, torch.Tensor) else v
+            dev = next(model.parameters()).device
+            return model(**{k: v.to(dev) if isinstance(v, torch.Tensor) else v
                             for k, v in samples.items()})
-        return model(samples.to(next(model.parameters()).device))
+        dev = model.model.language_model.embed_tokens.weight.device
+        return model(samples.to(dev))

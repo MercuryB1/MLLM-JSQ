@@ -93,9 +93,14 @@ def load_calib_data(config: CompressConfig, processor_or_tokenizer, model_type: 
         )
     else:
         from jsq.calibration.text import get_text_calib_data
+        # For MLLMs the second arg is a Processor; unwrap to get the plain tokenizer
+        # so text-only calibration datasets work without triggering image processing.
+        tok = processor_or_tokenizer
+        if hasattr(tok, "tokenizer"):
+            tok = tok.tokenizer
         return get_text_calib_data(
             dataset=config.calib_dataset,
-            tokenizer=processor_or_tokenizer,
+            tokenizer=tok,
             n_samples=config.nsamples,
             seq_len=config.seqlen,
             seed=config.seed,
@@ -185,8 +190,15 @@ def run(config: CompressConfig) -> None:
         logger.info("No compression passes enabled — skipping calibration data loading.")
 
     if passes:
+        # Compute per-sample vision token masks for MLLM multimodal calibration.
+        # Returns None for text-only models or text-mode MLLM calibration.
+        vision_masks = adapter.get_vision_token_mask(calib_data, processor)
+        if vision_masks is not None:
+            n_vis = sum(1 for m in vision_masks if m is not None and m.any())
+            logger.info(f"Vision masks: {n_vis}/{len(vision_masks)} samples have image tokens")
+
         pipeline = CompressionPipeline(passes=passes, adapter=adapter)
-        pipeline.run(model, calib_data, config, device)
+        pipeline.run(model, calib_data, config, device, vision_masks=vision_masks)
 
     check_sparsity(model, adapter)
 

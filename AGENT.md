@@ -1,538 +1,219 @@
-# AGENT.md — mllm-jsq 重构设计文档
-
-本文档是对 `llm-jsq` 代码库的深度分析与重构蓝图。在动手编写代码前请完整阅读。
+# AGENT.md — mllm-jsq 设计文档
 
 ---
 
-## 一、原始代码库的核心问题
+## hessian 分支：Modal-Aware Block-level JSQ (MA-JSQ)
 
-通过阅读 `llm-jsq` 全部源码，识别出以下具体的架构缺陷：
+### 一、核心思想
 
-### 1.1 硬编码的模型分支（最严重）
+**原始 JSQ 的局限**：per-layer 独立优化，每层稀疏度全局固定（如 43.75%），clip 用 layer 级 MSE 评估。各 pass 串联，误差累积，且完全不感知多模态结构。
 
-`smooth.py:164` — `smooth_layer()` 只处理 `LlamaDecoderLayer`，其他模型直接 `raise TypeError`：
-```python
-def smooth_layer(module, scales, alpha=0.5):
-    if isinstance(module, LlamaDecoderLayer):
-        ...
-    else:
-        raise TypeError(f"unsupported module: {module}")  # Qwen2 到这里直接崩
-```
-
-`fake_quant.py:237` — `quantize_layer()` 同样只认 `LlamaAttention` / `LlamaMLP`：
-```python
-def quantize_layer(module, ...):
-    for name, m in module.named_modules():
-        if isinstance(m, LlamaAttention):   # Qwen2Attention → 跳过
-            ...
-        elif isinstance(m, LlamaMLP):       # Qwen2MLP → 跳过
-            ...
-```
-对 Qwen2 或 Qwen2-VL，`quantize_layer` 静默地什么都不做。
-
-`utils.py:289` / `utils.py:322` — `move_embed()` 和 `get_blocks()` 是不断膨胀的 `elif` 链：
-```python
-def get_blocks(model):
-    if model.__class__.__name__ in ("LlamaForCausalLM", "Qwen2ForCausalLM"):
-        ...
-    elif isinstance(model, OPTForCausalLM):
-        ...
-    # 每加一个模型就要改这里 + move_embed 里也要改一遍
-    else:
-        raise NotImplementedError(type(model))
-```
-
-`prune.py:32` — `check_sparsity()` 直接写死 `model.model.layers`，对 MLLM 一定出错。
-
-### 1.2 遗留的调试代码
-
-`prune.py:296` — 有一行 `import pdb; pdb.set_trace()` 在 `auto_prune_layer_wanda` 里，
-会导致任何使用 WANDA 的压缩流程卡住等待终端输入。
-
-### 1.3 关注点混杂
-
-`main.py` 里混合了：模型加载、压缩调用、PPL 评估、MMLU 评估、多 GPU 分配，
-全部在 `main()` 和 `evaluate()` 两个函数里。
-
-`jsq.py` 的 `annealing_loop()` 内联了 `LlavaLlamaModel` 的特殊处理：
-```python
-if model.__class__.__name__ == "LlavaLlamaModel":
-    model.llm(samples...)
-else:
-    model(samples...)
-```
-每支持一个新 MLLM 就要在这里加 if。
-
-### 1.4 大量注释掉的死代码
-
-`jsq.py` 底部有约 80 行注释代码；`main.py` 底部有约 50 行注释代码。
-这些应当直接删除，不要保留。
-
-### 1.5 量化覆盖不完整
-
-`quantize_layer()` 依赖 `isinstance` 匹配具体子模块类型（`LlamaAttention`），
-但 Qwen2 用的是 `Qwen2Attention`，Qwen2-VL 的 LLM 部分用 `Qwen2VLDecoderLayer`，
-全部会被静默跳过，量化实际上不生效。
+**MA-JSQ 的改进**：以 block 为单位做联合优化。在固定 block 总稀疏度预算下，搜索 block 内各层的最优稀疏度分配，以 **Hessian 加权 + 模态解耦的 block 输出重建误差**为统一目标函数。
 
 ---
 
-## 二、重构目标
+### 二、目标函数
 
-**核心原则：**
-- 新增模型 = 新增一个文件（Adapter），不改动任何核心压缩代码
-- 压缩流程（prune / smooth / clip / quant）与模型结构完全解耦
-- MLLM 支持：只压缩 LLM decoder，ViT 和 Projector 保持 FP16 不变
-- 评测：用 `lmms-eval` 替代 `lm_eval`，同时保留文本 PPL 评测能力
+对第 $i$ 个 block，设原始输出为 $Y$，压缩后输出为 $\hat{Y}$：
+
+$$\mathcal{L}_{block}^{(i)} = \frac{1}{N_v} \left\| \sqrt{H_v} \odot (Y_v - \hat{Y}_v) \right\|_F^2 + \frac{\gamma}{N_t} \left\| \sqrt{H_t} \odot (Y_t - \hat{Y}_t) \right\|_F^2$$
+
+其中：
+- $H_v, H_t$：视觉/文本 token 的对角 Fisher（$\approx \text{mean}(Y^2)$，纯前向近似，无需 backward）
+- $M_v$：视觉 token 掩码，从 `input_ids` 中 `<|image_pad|>` 位置提取，与 ViT merger 输出 1:1 对应
+- $\gamma$：模态平衡因子（可搜索或固定）
+- 对纯文本模型，退化为标准 Hessian 加权 MSE
 
 ---
 
-## 三、目标目录结构
+### 三、搜索设计
+
+#### 搜索对象：block 内各层的稀疏度分配
+
+一个 block 含 $L$ 个 Linear 层（如 q/k/v/o/gate/up/down），总预算约束：
+
+$$\frac{\sum_l s_l \cdot n_l}{\sum_l n_l} = s_{target}$$
+
+每层 $s_l$ 从小候选集中取值，例如 $\{s_{target} - 0.1,\ s_{target} - 0.05,\ s_{target},\ s_{target} + 0.05,\ s_{target} + 0.1\}$，预算约束大幅削减实际候选数量。
+
+#### 与原始 JSQ 的关系
+
+JSQ importance score 依然负责**决定哪些权重被剪**（mask 内部排序不变），搜索只决定**每层剪多少**。两者正交，MA-JSQ 是 JSQ 的自然扩展而非替代。
+
+#### 候选生成策略
+
+不做全组合枚举，而是用 JSQ score 引导生成少量有意义的候选：
+
+1. **Uniform**：所有层 $s_l = s_{target}$（baseline）
+2. **Attn-light**：注意力层稀疏度 $-\delta$，MLP 层 $+\delta$（补偿预算）
+3. **MLP-light**：反之
+4. **Sensitivity-driven**：按每层 $\text{tr}(H_l) = \sum_j H_{lj}$（从 input_feat 计算）做反比分配，灵敏度高的层少剪
+
+候选数量控制在 **5-10 个**，每个候选跑一次 block forward 即可评估，总开销约为当前 clip grid search 的同量级。
+
+---
+
+### 四、每个 Block 的完整流程
+
+```
+输入：inps（当前 block 输入），layer_kwargs
+
+Step 1  [免费] 原始前向
+    Y_orig = block(inps)
+    H = mean(Y_orig²)                        # Fisher proxy，shape [seq, hidden]
+    H_v = H[vision_mask],  H_t = H[~vision_mask]   # 模态分离
+
+Step 2  [免费] 计算各层 Hessian trace
+    tr(H_l) = sum(mean(feat_l²))             # 从 input_feat 直接算，不额外跑前向
+
+Step 3  [搜索] 生成候选稀疏度分配
+    configs = generate_candidates(s_target, tr_H_per_layer)   # ~5-10 个
+
+Step 4  [搜索] 评估每个候选
+    for config in configs:
+        block_copy = deepcopy(block)
+        apply prune(config.s_l) + smooth + clip + quant  →  block_copy
+        Ŷ = block_copy(inps)
+        err = hessian_block_error(Y_orig, Ŷ, H_v, H_t, γ)
+
+Step 5  [应用] 选最优 config，写入原始 block
+    apply best config to block (in-place)
+
+Step 6  更新 inps = block(inps)，进入下一个 block
+```
+
+---
+
+### 五、与现有框架的关系
+
+| 组件 | 现有行为 | MA-JSQ 改动 |
+|------|---------|------------|
+| `PruningPass` | 全局固定 `sparsity_ratio` | 接受 per-layer `{name: s_l}` dict |
+| `ClippingPass` | layer 级 MSE grid search | 作为 Step 4 内部子步骤，不变 |
+| `SmoothingPass` | 全局固定 `alpha` | 暂不搜索，保持固定（可后续扩展）|
+| `CompressionPipeline` | 顺序调用各 pass | 外层加 block 级搜索循环 |
+| `collector.py` | 收集 input_feat | 同时输出 Y_orig（已有） |
+| `ModelAdapter` | — | 新增 `get_vision_token_mask()` |
+
+---
+
+### 六、需要新增/修改的文件
+
+| 文件 | 改动 |
+|------|------|
+| `jsq/config.py` | 新增 `gamma: float = 1.0`，`n_search_candidates: int = 8` |
+| `jsq/compression/block_search.py` | **新文件**：`BlockSearcher`，封装 Step 1-5 |
+| `jsq/compression/pipeline.py` | 用 `BlockSearcher` 替换原有 per-block 逻辑 |
+| `jsq/compression/passes/prune.py` | `PruningPass.apply()` 支持 per-layer sparsity dict |
+| `jsq/compression/passes/clip.py` | 误差函数改为 Hessian 加权（`vision_mask` 注入）|
+| `jsq/models/base.py` | 新增 `get_vision_token_mask(calib_samples, processor)` |
+| `jsq/models/qwen2_vl.py` 等 | 实现 vision mask 提取 |
+| `run.py` | 计算 `vision_mask`，传给 pipeline |
+| `main.py` | 新增 `--gamma`，`--n_search_candidates` 参数 |
+
+---
+
+### 七、开放问题
+
+1. **deepcopy 代价**：Step 4 每个候选需要 copy block 权重，7B 模型单 block 约 500MB，需要确认显存是否够用，或改为 save/restore patch 的方式（只存 diff）
+2. **clip 在搜索内层的位置**：clip grid search 本身较慢，是否在外层搜索时用简化版（跳过 clip 只做 prune+quant），赢家出来后再做完整 clip？
+3. **γ 的设定**：固定为 1.0，还是按 $N_v/N_t$ 自适应，还是作为一个可搜索的超参？
+4. **vision mask 准确性**：Qwen2.5-VL 中 `<|image_pad|>` 与 ViT merger 输出是否严格 1:1，需要代码验证
+
+---
+
+### 八、实现进度（hessian 分支）
+
+#### 已完成
+
+所有设计文件均已实现并提交到 `hessian` 分支：
+
+| 文件 | 状态 | 关键改动 |
+|------|------|---------|
+| `jsq/config.py` | ✅ | `gamma`, `n_search_candidates` |
+| `jsq/compression/block_search.py` | ✅ | `BlockSearcher`，含分块 trace_H、lite_feat、per-sample forward |
+| `jsq/compression/pipeline.py` | ✅ | 使用 `BlockSearcher` |
+| `jsq/compression/passes/prune.py` | ✅ | `per_layer_sparsity` dict 支持 |
+| `jsq/compression/passes/clip.py` | ✅ | Hessian 加权误差 |
+| `jsq/compression/collector.py` | ✅ | `_slice_kw_for_sample`（支持 tuple），所有 text 模式改为 per-sample forward |
+| `jsq/models/base.py` | ✅ | `get_vision_token_mask()` 默认 no-op |
+| `jsq/models/qwen2_vl.py` | ✅ | vision mask 提取，`run_forward_for_calibration` 修复 |
+| `jsq/models/qwen2_5_vl.py` | ✅ | 同上 |
+| `run.py` | ✅ | vision_mask 计算，tokenizer unwrap |
+| `main.py` | ✅ | `--gamma`、`--n_search_candidates` 参数 |
+
+#### 核心 Bug 修复记录
+
+1. **`collector.py` per-sample forward**（最新修复）
+   - 问题：text 模式用全 batch（128）跑 block forward，Qwen2-VL 的 SDPA math backend 分配 56GB attention matrix → OOM
+   - 修复：`collect_block_input_feat_and_output`、`collect_block_input_feat`、`run_block` 均改为逐样本 forward
+   - 关键：`_slice_kw_for_sample` 需处理 `position_embeddings = (cos, sin)` tuple，旧版只处理 Tensor 导致 batch=128 的 tuple 未被 slice，新版正确 slice
+
+2. **`block_search.py` `_slice_kw_for_sample` tuple 处理**
+   - 旧版不处理 tuple，`_run_forward_lite` 传入 batch=1 input 但 batch=128 的 position_embeddings → OOM
+   - 修复：统一用 `collector.py` 中的 `_slice_kw_for_sample`（已处理 tuple）
+
+3. **`_compute_layer_trace_H` 分块计算**
+   - 问题：`feat.float().pow(2).mean()` 一次性 fp32 转换 → 3.5GB OOM
+   - 修复：512 token 分块，每块 fp32 后释放
+
+4. **`run_forward_for_calibration` device 问题**
+   - 问题：text 模式用 `next(model.parameters()).device` 取到 ViT 的 CPU device
+   - 修复：改用 `model.model.language_model.embed_tokens.weight.device`
+
+5. **`block_search.py` `_hessian_block_error` device 不一致**
+   - 问题：multimodal 模式下 `_run_forward_lite` 输出保留在 GPU（list of GPU tensors），`_flatten` 后 `diff_sq` 在 GPU；但 `vision_mask_flat` 由 `_build_flat_vision_mask` 在 CPU 构建，`diff_sq[vision_mask_flat]` 触发 device mismatch
+   - 修复：`_hessian_block_error` 内部在索引前将 `mask` 移到 `diff_sq.device`
+
+6. **`block_search.py` FP16 overflow in H**
+   - 问题：深层 block 的 hidden states 量级可达 100–1000，FP16 最大值仅 65504；`H = Y_orig_flat.pow(2)` 在 FP16 下溢出为 inf，导致 block 2 以后所有 candidate 的 err=nan/inf
+   - 修复：`H = Y_orig_flat.float().pow(2)`（FP32）；`_hessian_block_error` 内部也把 Y 张量转为 FP32 再做差
+
+7. **`_generate_candidates` 预算补偿公式导致极端稀疏度（GQA 架构特有）**
+   - 问题：MLP-light 候选用 `a_s = (budget - m_s * n_mlp) / n_attn` 做预算补偿；Qwen2-VL 是 GQA（4 KV heads），`n_attn ≪ n_mlp`，补偿后 attn 层稀疏度高达 78%，压缩后 attention 质量崩溃
+   - 修复：改用对称 delta（`a_s = s_target ± d, m_s = s_target ∓ d`），由 `scale_to_budget` 做轻微均匀调整，最大偏离仍受控在 ≈ ±5%
+
+#### MME 实验结果（Qwen2-VL-7B-Instruct, s=0.4375, W8A8）
+
+| 版本 | Cognition | Perception | **Total** | 备注 |
+|------|-----------|------------|-----------|------|
+| Baseline (n=1, uniform) | 623.9 | 1615.7 | **2239.6** | 纯均匀稀疏 |
+| MA-JSQ v1 (n=8, 无限幅) | 545.7 | 1547.0 | 2092.7 | attn 最高 78%，严重退化 |
+| MA-JSQ v2 (n=8, sens cap=0.1) | 600.0 | 1589.7 | 2189.7 | 仍有 MLP-light 问题 |
+| **MA-JSQ v3 (n=8, 对称δ)** | **617.9** | **1633.1** | **2250.9** | ✅ 超过 baseline +11.3 |
+
+MA-JSQ v3 在 Perception 上超 baseline +17.4 分，总分 +11.3 分。
+
+---
+
+## 基础架构（main 分支，不在此分支修改）
+
+### 目录结构
 
 ```
 mllm-jsq/
-├── main.py                          # CLI 入口：解析参数 → 构建 Config → 调用 run()
-├── run.py                           # run(): 加载模型 → 压缩 → 评估
+├── main.py
+├── run.py
 ├── jsq/
-│   ├── config.py                    # CompressConfig dataclass（类型安全）
-│   │
-│   ├── models/                      # 模型适配层（Adapter 模式）
-│   │   ├── base.py                  # ModelAdapter ABC
-│   │   ├── registry.py              # @register_adapter + get_adapter(model_type)
-│   │   ├── llama.py                 # LlamaAdapter
-│   │   ├── qwen2.py                 # Qwen2Adapter
-│   │   └── qwen2_vl.py              # Qwen2VLAdapter（MLLM 首期目标）
-│   │
-│   ├── compression/
-│   │   ├── pipeline.py              # CompressionPipeline：驱动逐层循环
-│   │   ├── collector.py             # FeatureCollector：Hook 收集输入特征
-│   │   └── passes/
-│   │       ├── base.py              # CompressionPass ABC
-│   │       ├── prune.py             # PruningPass（JSQ v1/v2、WANDA、Magnitude）
-│   │       ├── smooth.py            # SmoothingPass
-│   │       ├── clip.py              # ClippingPass
-│   │       └── quantize.py          # QuantizationPass
-│   │
-│   ├── quant/
-│   │   ├── linear.py                # QuantLinear（清理后的版本）
-│   │   └── ops.py                   # 纯函数：quantize_weight_* / quantize_act_*
-│   │
-│   ├── calibration/
-│   │   ├── text.py                  # 文本校准数据（C4、WikiText2、Pile）
-│   │   └── multimodal.py            # 图文配对校准数据（COCO、ShareGPT4V）
-│   │
-│   └── eval/
-│       ├── ppl.py                   # WikiText-2 PPL 评测
-│       └── lmms_eval.py             # lmms-eval 集成
-│
+│   ├── config.py
+│   ├── models/           base · registry · llama · qwen2 · qwen2_vl · qwen2_5_vl · qwen3_vl
+│   ├── compression/      pipeline · collector · passes/{prune,smooth,clip,quantize}
+│   ├── quant/            ops · linear
+│   ├── calibration/      text · multimodal
+│   └── eval/             ppl · lmms_eval
 ├── configs/
-│   ├── llama2_7b_w8a8.yaml
-│   └── qwen2_vl_7b_w8a8_s0.4375.yaml
-│
 └── scripts/
-    ├── compress_llm.sh
-    └── compress_qwen2vl.sh
 ```
 
----
+### 压缩流程（main 分支）
 
-## 四、核心接口设计
-
-### 4.1 `ModelAdapter` ABC（`jsq/models/base.py`）
-
-这是整个重构的枢纽。每个模型家族实现这个接口，核心压缩代码只依赖这个接口。
-
-```python
-from abc import ABC, abstractmethod
-from typing import List, Dict, Tuple
-import torch.nn as nn
-
-class ModelAdapter(ABC):
-
-    @abstractmethod
-    def get_llm_blocks(self, model: nn.Module) -> List[nn.Module]:
-        """返回需要压缩的 Transformer Block 列表（仅 LLM decoder）。
-        对 MLLM，不包含 ViT 和 Projector。"""
-
-    @abstractmethod
-    def move_llm_embed(self, model: nn.Module, device) -> None:
-        """将 LLM 侧的 embedding 层移动到指定 device。
-        对 MLLM，不移动 ViT 相关模块。"""
-
-    @abstractmethod
-    def get_named_linears(self, block: nn.Module) -> Dict[str, nn.Linear]:
-        """返回 block 内所有需要参与压缩的 Linear 层（name → module）。"""
-
-    @abstractmethod
-    def get_smooth_pairs(self, block: nn.Module) -> List[Tuple]:
-        """返回该 block 的 (norm_layer, [linear, ...]) 对，用于激活平滑。
-        每个 tuple 表示一组 LayerNorm → Linear 的平滑关系。
-
-        示例（LLaMA）：
-          [(input_layernorm, [q_proj, k_proj, v_proj]),
-           (post_attention_layernorm, [gate_proj, up_proj])]
-        """
-
-    def run_forward_for_calibration(self, model: nn.Module, samples, **kwargs):
-        """驱动模型前向以捕获 LLM 第一层输入。
-        默认实现直接调用 model(samples)；
-        MLLM 子类可覆盖此方法以正确处理图文混合输入。"""
-        return model(samples, **kwargs)
 ```
-
-### 4.2 模型注册表（`jsq/models/registry.py`）
-
-```python
-_REGISTRY: Dict[str, Type[ModelAdapter]] = {}
-
-def register_adapter(*model_types: str):
-    """装饰器，将 Adapter 类注册到 model_type 字符串。"""
-    def decorator(cls):
-        for t in model_types:
-            _REGISTRY[t] = cls
-        return cls
-    return decorator
-
-def get_adapter(model) -> ModelAdapter:
-    """根据 model.config.model_type 查找 Adapter。"""
-    model_type = model.config.model_type  # e.g. "qwen2_vl", "llama"
-    if model_type not in _REGISTRY:
-        raise NotImplementedError(f"No adapter registered for model_type='{model_type}'")
-    return _REGISTRY[model_type]()
-```
-
-### 4.3 各模型 Adapter 实现
-
-**`jsq/models/llama.py`**
-```python
-@register_adapter("llama")
-class LlamaAdapter(ModelAdapter):
-    def get_llm_blocks(self, model): return model.model.layers
-    def move_llm_embed(self, model, device):
-        model.model.embed_tokens.to(device)
-        model.model.rotary_emb.to(device)
-    def get_named_linears(self, block):
-        return {n: m for n, m in block.named_modules() if isinstance(m, nn.Linear)}
-    def get_smooth_pairs(self, block):
-        return [
-            (block.input_layernorm,
-             [block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj]),
-            (block.post_attention_layernorm,
-             [block.mlp.gate_proj, block.mlp.up_proj]),
-        ]
-```
-
-**`jsq/models/qwen2.py`**
-```python
-@register_adapter("qwen2")
-class Qwen2Adapter(ModelAdapter):
-    # Qwen2DecoderLayer 结构与 LLaMA 几乎相同，直接复用逻辑
-    def get_llm_blocks(self, model): return model.model.layers
-    def move_llm_embed(self, model, device):
-        model.model.embed_tokens.to(device)
-        model.model.rotary_emb.to(device)
-    def get_named_linears(self, block):
-        return {n: m for n, m in block.named_modules() if isinstance(m, nn.Linear)}
-    def get_smooth_pairs(self, block):
-        return [
-            (block.input_layernorm,
-             [block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj]),
-            (block.post_attention_layernorm,
-             [block.mlp.gate_proj, block.mlp.up_proj]),
-        ]
-```
-
-**`jsq/models/qwen2_vl.py`**（关键：MLLM 适配）
-```python
-@register_adapter("qwen2_vl")
-class Qwen2VLAdapter(ModelAdapter):
-    """
-    Qwen2-VL 模型结构：
-      model.visual        ← ViT，保持 FP16，不压缩，不移动
-      model.visual.merger ← Projector，保持 FP16，不压缩
-      model.model.layers  ← LLM decoder，压缩目标
-      model.model.embed_tokens
-      model.model.rotary_emb (mrope)
-    """
-    def get_llm_blocks(self, model):
-        # 只返回 LLM decoder blocks，不包含 ViT
-        return model.model.layers
-
-    def move_llm_embed(self, model, device):
-        # 只移动 LLM 侧的 embedding，ViT 留在原设备
-        model.model.embed_tokens.to(device)
-        # Qwen2-VL 用 MRoPE，rotary_emb 挂在 model.model 下
-        if hasattr(model.model, "rotary_emb"):
-            model.model.rotary_emb.to(device)
-
-    def get_named_linears(self, block):
-        return {n: m for n, m in block.named_modules() if isinstance(m, nn.Linear)}
-
-    def get_smooth_pairs(self, block):
-        # Qwen2-VL LLM decoder 与 Qwen2 结构相同
-        return [
-            (block.input_layernorm,
-             [block.self_attn.q_proj, block.self_attn.k_proj, block.self_attn.v_proj]),
-            (block.post_attention_layernorm,
-             [block.mlp.gate_proj, block.mlp.up_proj]),
-        ]
-
-    def run_forward_for_calibration(self, model, samples, **kwargs):
-        """
-        MLLM 校准前向：
-        如果 samples 是图文配对（含 pixel_values），正常执行全模型前向；
-        ViT 的前向输出会被融入 input_embeds，再传入 LLM 第一层。
-        Catcher hook 会拦截 LLM 第一层的输入。
-        """
-        if isinstance(samples, dict):
-            return model(**samples)
-        return model(samples, **kwargs)
-```
-
-### 4.4 `CompressionPass` ABC（`jsq/compression/passes/base.py`）
-
-```python
-from abc import ABC, abstractmethod
-from typing import Dict
-import torch
-
-class CompressionPass(ABC):
-    @abstractmethod
-    def apply(
-        self,
-        block: torch.nn.Module,
-        input_feat: Dict[str, torch.Tensor],  # name → 收集到的输入激活
-        adapter,                               # ModelAdapter 实例
-        config,                                # CompressConfig
-    ) -> None:
-        """原地修改 block 的权重，无返回值。"""
-```
-
-各 Pass 实现：
-- `PruningPass.apply()` → 调用 JSQ/WANDA/Magnitude 度量函数，原地置零权重
-- `SmoothingPass.apply()` → 调用 `adapter.get_smooth_pairs(block)`，执行 smooth_ln_fcs
-- `ClippingPass.apply()` → 搜索最优 clip 阈值，原地 clamp 权重
-- `QuantizationPass.apply()` → 遍历 `adapter.get_named_linears(block)`，替换为 `QuantLinear`
-
-### 4.5 `CompressionPipeline`（`jsq/compression/pipeline.py`）
-
-```python
-class CompressionPipeline:
-    def __init__(self, passes: List[CompressionPass], adapter: ModelAdapter):
-        self.passes = passes
-        self.adapter = adapter
-
-    @torch.no_grad()
-    def run(self, model, calib_samples, config):
-        blocks = self.adapter.get_llm_blocks(model)
-
-        # 用 Catcher 收集第一层输入
-        inps, layer_kwargs = collect_first_layer_inputs(
-            model, calib_samples, blocks,
-            forward_fn=self.adapter.run_forward_for_calibration
-        )
-
-        self.adapter.move_llm_embed(model, "cpu")
-
-        for i, block in enumerate(tqdm(blocks)):
-            block.cuda()
-
-            # 收集本层所有 Linear 的输入特征
-            input_feat = collect_block_input_feat(block, inps, layer_kwargs)
-
-            # 依次执行各 pass
-            for pass_ in self.passes:
-                pass_.apply(block, input_feat, self.adapter, config)
-
-            # 更新下一层的输入
-            inps = run_block(block, inps, layer_kwargs)
-            block.cpu()
-            torch.cuda.empty_cache()
-```
-
-### 4.6 `CompressConfig` dataclass（`jsq/config.py`）
-
-```python
-@dataclass
-class CompressConfig:
-    # 模型
-    model: str
-
-    # 校准
-    calib_dataset: str = "pileval"         # pileval / c4 / wikitext2 / coco_captions
-    nsamples: int = 128
-    seqlen: int = 2048
-    seed: int = 42
-
-    # 剪枝
-    pruning_method: str = "jsq_v1"        # jsq_v1 / jsq_v2 / wanda / magnitude / none
-    sparsity_ratio: float = 0.0
-    sparsity_type: str = "unstructured"   # unstructured / 2:4 / 4:8
-    rho: float = 2.1
-
-    # 量化
-    w_bits: int = 8
-    a_bits: int = 8
-    weight_quant: str = "per_channel"     # per_channel / per_tensor
-    act_quant: str = "per_token"          # per_token / per_tensor
-
-    # 激活平滑
-    smooth_alpha: float = 0.8
-
-    # 评测
-    eval_ppl: bool = False
-    tasks: Optional[str] = None           # lmms-eval task 名，逗号分隔
-    num_fewshot: int = 0
-
-    # 其他
-    save_dir: Optional[str] = None
-    multigpu: bool = False
-    batch_size: int = 1
-```
-
----
-
-## 五、lmms-eval 集成设计（`jsq/eval/lmms_eval.py`）
-
-```python
-# lmms-eval 要求 model class 实现 lmms_eval.api.model.lmms 接口
-from lmms_eval.api.model import lmms
-
-class CompressedMLLMWrapper(lmms):
-    """将压缩后的 MLLM 包装为 lmms-eval 可用的模型。"""
-
-    def __init__(self, model, processor, config):
-        self.model = model
-        self.processor = processor
-        self.config = config
-
-    def generate_until(self, requests): ...
-    def loglikelihood(self, requests): ...
-
-def run_lmms_eval(model, processor, config: CompressConfig):
-    """调用 lmms-eval 进行多模态基准评测。"""
-    from lmms_eval import evaluator
-
-    wrapped = CompressedMLLMWrapper(model, processor, config)
-    task_names = [t.strip() for t in config.tasks.split(",")]
-
-    results = evaluator.simple_evaluate(
-        model=wrapped,
-        tasks=task_names,
-        num_fewshot=config.num_fewshot,
-    )
-    return results
-```
-
-支持的 lmms-eval tasks（优先适配）：
-- `mmbench_en_dev` — MMBench English
-- `seedbench` — SEED-Bench
-- `mme` — MME
-- `gqa` — GQA
-- `textvqa_val` — TextVQA
-- `vqav2_val` — VQAv2
-
----
-
-## 六、实现顺序（Task List）
-
-### Phase 1 — 基础设施（无模型依赖）
-- [ ] `jsq/config.py` — CompressConfig dataclass
-- [ ] `jsq/quant/ops.py` — 纯函数量化（从 fake_quant.py 提取，无模型类型依赖）
-- [ ] `jsq/quant/linear.py` — QuantLinear（清理版，移除 `LlamaAttention` 依赖）
-- [ ] `jsq/models/base.py` — ModelAdapter ABC
-- [ ] `jsq/models/registry.py` — register_adapter + get_adapter
-- [ ] `jsq/compression/passes/base.py` — CompressionPass ABC
-- [ ] `jsq/compression/collector.py` — FeatureCollector（Catcher hook 抽象）
-
-### Phase 2 — 压缩 Pass 实现
-- [ ] `jsq/compression/passes/prune.py` — PruningPass（含 JSQ v1/v2、WANDA、Magnitude）
-- [ ] `jsq/compression/passes/smooth.py` — SmoothingPass（通过 adapter.get_smooth_pairs）
-- [ ] `jsq/compression/passes/clip.py` — ClippingPass
-- [ ] `jsq/compression/passes/quantize.py` — QuantizationPass（通过 adapter.get_named_linears）
-- [ ] `jsq/compression/pipeline.py` — CompressionPipeline
-
-### Phase 3 — 模型 Adapter
-- [ ] `jsq/models/llama.py` — LlamaAdapter（验证与原代码等价）
-- [ ] `jsq/models/qwen2.py` — Qwen2Adapter
-- [ ] `jsq/models/qwen2_vl.py` — Qwen2VLAdapter（MLLM 核心）
-
-### Phase 4 — 校准数据
-- [ ] `jsq/calibration/text.py` — Pileval / C4 / WikiText2
-- [ ] `jsq/calibration/multimodal.py` — COCO Captions / ShareGPT4V 图文配对
-
-### Phase 5 — 评测集成
-- [ ] `jsq/eval/ppl.py` — WikiText-2 PPL
-- [ ] `jsq/eval/lmms_eval.py` — CompressedMLLMWrapper + run_lmms_eval
-
-### Phase 6 — 入口与脚本
-- [ ] `run.py` — 组装所有组件的主函数
-- [ ] `main.py` — CLI（argparse → CompressConfig → run()）
-- [ ] `scripts/compress_qwen2vl.sh` — 端到端示例脚本
-
----
-
-## 七、关键实现注意事项
-
-### Qwen2-VL 模型路径
-```
-Qwen2VLForConditionalGeneration
-  ├── model.visual              # ViT，不压缩
-  │   └── merger                # Projector，不压缩
-  ├── model.embed_tokens        # LLM embedding
-  ├── model.layers[0..N]        # LLM decoder blocks，压缩目标
-  ├── model.norm
-  └── lm_head
-```
-`model.config.model_type == "qwen2_vl"`，可用于注册表查找。
-
-### 多模态校准流程
-```
-1. 加载图文配对样本（pixel_values + input_ids）
-2. 整个模型 forward（ViT FP16 → merger → embed 融合）
-3. Catcher 拦截 model.model.layers[0] 的输入
-   → 此时 inps 已包含融合了视觉特征的 hidden states
-4. 此后的逐层压缩与纯 LLM 完全一致
-```
-关键：ViT 全程保持 FP16，不加任何 hook，不做任何修改。
-
-### 平滑层的处理方式变化
-原来：`smooth_layer()` 对具体类型做 `isinstance` 判断。
-新架构：`SmoothingPass` 调用 `adapter.get_smooth_pairs(block)` 获取 `(norm, fcs)` 对，
-然后调用统一的 `smooth_ln_fcs_rms()` 或 `smooth_ln_fcs()` 纯函数。
-模型结构知识完全在 Adapter 里，Pass 本身不感知模型类型。
-
-### 量化层替换的处理方式变化
-原来：`quantize_layer()` 对具体 Attention/MLP 类做 `isinstance`。
-新架构：`QuantizationPass` 调用 `adapter.get_named_linears(block)` 得到所有 Linear，
-统一调用 `QuantLinear.from_float()` 替换，不需要知道外层是哪种 Attention。
-
----
-
-## 八、快速验证命令（实现后）
-
-```bash
-# 1. 纯 LLM（Qwen2），验证与原代码结果一致
-python main.py \
-  --model Qwen/Qwen2-7B-Instruct \
-  --pruning_method jsq_v1 \
-  --sparsity_ratio 0.4375 \
-  --w_bits 8 --a_bits 8 \
-  --eval_ppl
-
-# 2. MLLM（Qwen2-VL），文本校准 + PPL 验证
-python main.py \
-  --model Qwen/Qwen2-VL-7B-Instruct \
-  --pruning_method jsq_v1 \
-  --sparsity_ratio 0.4375 \
-  --w_bits 8 --a_bits 8 \
-  --eval_ppl
-
-# 3. MLLM（Qwen2-VL），图文校准 + lmms-eval 评测
-python main.py \
-  --model Qwen/Qwen2-VL-7B-Instruct \
-  --calib_dataset coco_captions \
-  --pruning_method jsq_v1 \
-  --sparsity_ratio 0.4375 \
-  --w_bits 8 --a_bits 8 \
-  --tasks mmbench_en_dev,seedbench,mme
+校准数据 → collect_first_layer_inputs
+         → for each block:
+               collect_block_input_feat   (Linear 输入特征 + block 输出)
+               PruningPass   (JSQ/WANDA，固定全局稀疏度)
+               SmoothingPass (固定 α)
+               ClippingPass  (layer 级 MSE grid search)
+               QuantizationPass (W8A8)
+               block.cpu()
 ```

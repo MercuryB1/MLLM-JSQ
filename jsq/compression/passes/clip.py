@@ -1,6 +1,6 @@
 """Clipping pass: search for optimal weight clipping thresholds."""
 import gc
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -19,8 +19,13 @@ def _clip_layer(
     n_grid: int = 20,
     max_shrink: float = 0.5,
     n_sample_token: int = 512,
+    feat_hessian: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Search for the best per-group clipping threshold via grid search.
+
+    When *feat_hessian* is provided (shape [n_tokens], computed as mean(feat²)
+    over the hidden dim), token-level errors are weighted by it — layers whose
+    inputs carry more variance are penalised more heavily.
 
     Returns best_max_val of shape [out_features, n_groups].
     """
@@ -30,6 +35,12 @@ def _clip_layer(
     # Sub-sample tokens to keep memory bounded
     step = max(1, feat.shape[0] // n_sample_token)
     feat = feat[::step]
+    h_weights: Optional[torch.Tensor] = None
+    if feat_hessian is not None:
+        feat_hessian = feat_hessian.view(-1)
+        feat_hessian = feat_hessian[::step]
+        h_sum = feat_hessian.sum().clamp(min=1e-8)
+        h_weights = (feat_hessian / h_sum).reshape(1, -1, 1)  # [1, n_tok, 1]
 
     feat = feat.reshape(1, feat.shape[0], -1, group_size)
     w_4d = w.reshape(w.shape[0], 1, -1, group_size)
@@ -54,7 +65,12 @@ def _clip_layer(
             cur_w = torch.clamp(w_b, -max_val, max_val)
             q_w = quantize_weight_per_tensor_absmax(cur_w.clone(), w_bits=w_bits)
             cur_out = (feat_dev * q_w).sum(dim=-1)
-            err = (cur_out - org_out).pow(2).mean(dim=1).view(min_errs.shape)
+            diff_sq = (cur_out - org_out).pow(2)  # [oc, n_tok, n_g]
+            if h_weights is not None:
+                hw = h_weights.to(diff_sq.device)  # [1, n_tok, 1]
+                err = (diff_sq * hw).sum(dim=1).view(min_errs.shape)
+            else:
+                err = diff_sq.mean(dim=1).view(min_errs.shape)
             better = err < min_errs
             min_errs[better] = err[better]
             best_max[better] = max_val[better]
@@ -83,7 +99,11 @@ def _apply_clip(module: nn.Module, clip_list: List[Tuple[str, torch.Tensor]]) ->
 
 
 class ClippingPass(CompressionPass):
-    """Search for optimal weight clip thresholds and apply them."""
+    """Search for optimal weight clip thresholds and apply them.
+
+    Uses Hessian-weighted error (second moment of input activations) to bias
+    the grid search towards preserving outputs on high-variance tokens.
+    """
 
     def apply(self, block, input_feat: Dict[str, torch.Tensor], adapter, config) -> None:
         named_linears = adapter.get_named_linears(block)
@@ -97,12 +117,19 @@ class ClippingPass(CompressionPass):
             if name not in input_feat:
                 continue
 
+            feat = input_feat[name].float()
+
+            # Hessian proxy: per-token importance = mean(feat²) over hidden dim
+            feat_flat = feat.view(-1, feat.shape[-1])
+            feat_hessian = feat_flat.pow(2).mean(dim=-1)  # [n_tokens]
+
             try:
                 max_val = _clip_layer(
                     linear.weight.data.float(),
-                    input_feat[name].float(),
+                    feat,
                     w_bits=config.w_bits,
                     n_sample_token=config.nsamples,
+                    feat_hessian=feat_hessian,
                 )
                 clip_list.append((name, max_val))
             except Exception as e:
