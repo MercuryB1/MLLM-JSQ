@@ -3,11 +3,37 @@
 This module wraps a compressed MLLM so it can be evaluated by the
 lmms-eval framework (https://github.com/EvolvingLMMs-Lab/lmms-eval).
 """
+import os
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 from loguru import logger
+
+
+_LMMS_FILE_SINK_ID = None
+
+
+def _attach_lmms_file_sink(eval_logger) -> None:
+    """给 lmms-eval 官方 logger 挂载文件 sink（若配置了日志文件路径）。"""
+    global _LMMS_FILE_SINK_ID
+
+    log_file = os.getenv("JSQ_LOG_FILE")
+    if not log_file:
+        return
+
+    # 仅在当前进程首次挂载，避免重复写入。
+    if _LMMS_FILE_SINK_ID is not None:
+        return
+
+    _LMMS_FILE_SINK_ID = eval_logger.add(
+        log_file,
+        level=os.getenv("JSQ_LOG_LEVEL", "INFO"),
+        enqueue=True,
+        backtrace=False,
+        diagnose=False,
+    )
+    eval_logger.info(f"lmms-eval 文件日志已启用: {log_file}")
 
 
 def run_lmms_eval(
@@ -21,11 +47,15 @@ def run_lmms_eval(
     """Run lmms-eval benchmarks on a compressed MLLM."""
     try:
         from lmms_eval import evaluator
+        from loguru import logger as eval_logger
     except ImportError:
         raise ImportError(
             "lmms-eval is not installed. Install it with:\n"
             "  pip install lmms-eval"
         )
+
+    # lmms-eval 在导入链中会 reset logger；导入完成后按其 logger 体系补充文件 sink。
+    _attach_lmms_file_sink(eval_logger)
 
     task_names = [t.strip() for t in tasks.split(",")]
     logger.info(f"Running lmms-eval on tasks: {task_names}")
@@ -104,9 +134,9 @@ def _make_wrapper(model: nn.Module, processor, batch_size: int,
 def _log_results(results: Dict) -> None:
     try:
         from lmms_eval.utils import make_table
-        print(make_table(results))
+        logger.info("\n" + make_table(results))
         if "groups" in results:
-            print(make_table(results, "groups"))
+            logger.info("\n" + make_table(results, "groups"))
     except Exception:
         pass
     if "results" not in results:
