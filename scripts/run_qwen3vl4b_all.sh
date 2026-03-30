@@ -5,7 +5,10 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+# export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-2}
+export CUDA_VISIBLE_DEVICES=2
+echo "[GPU] 总控 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+
 # 模型未命中本地缓存时，优先通过 HF 镜像下载。
 export HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 
@@ -28,13 +31,13 @@ mkdir -p "${BASELINE_LOG_DIR}" "${V1_LOG_DIR}" "${V2_LOG_DIR}" "${RUN_DIR}/summa
 echo "[总控] 运行目录: ${RUN_DIR}"
 echo "[总控] 任务列表: ${TASKS}"
 
-# # 第 1 步：评测 baseline 模型（不压缩，不加载 save_dir）
-# echo "[总控] 开始 baseline 评测（若未缓存将走 HF 镜像下载）"
-# python main.py \
-#   --model "${MODEL}" \
-#   --tasks "${TASKS}" \
-#   --no_compress \
-#   --log_dir "${BASELINE_LOG_DIR}"
+# 第 1 步：评测 baseline 模型（不压缩，不加载 save_dir）
+echo "[总控] 开始 baseline 评测（若未缓存将走 HF 镜像下载）"
+python main.py \
+  --model "${MODEL}" \
+  --tasks "${TASKS}" \
+  --no_compress \
+  --log_dir "${BASELINE_LOG_DIR}"
 
 # 第 2 步：JSQ v1 压缩 + 评测
 echo "[总控] 开始 JSQ v1"

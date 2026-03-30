@@ -2,7 +2,9 @@
 # Evaluate Qwen3-VL-4B-Instruct with lmms-eval.
 # Usage: bash scripts/eval_qwen3vl4b.sh [model] [save_dir] [tasks] [log_dir]
 
-export CUDA_VISIBLE_DEVICES=0
+# 仅在外部未指定时使用默认卡，避免覆盖总控或命令行传入的设置。
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+echo "[GPU] 当前 CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 set -e
 
