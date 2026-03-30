@@ -38,6 +38,7 @@ class CompressConfig:
 
     # Storage
     data_dir: str = "storage/datasets"   # local directory for calibration datasets
+    log_dir: Optional[str] = None          # directory to store runtime logs
 
     # Other
     save_dir: Optional[str] = None

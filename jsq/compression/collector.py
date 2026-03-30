@@ -45,6 +45,13 @@ def _to_device(kwargs: Dict, device) -> Dict:
     }
 
 
+def _extract_hidden_states(layer_out):
+    """兼容不同 decoder layer 返回格式，统一提取 hidden_states。"""
+    if isinstance(layer_out, (tuple, list)):
+        return layer_out[0]
+    return layer_out
+
+
 @torch.no_grad()
 def collect_first_layer_inputs(
     model: nn.Module,
@@ -143,7 +150,7 @@ def collect_block_input_feat_and_output(
             mod.register_forward_hook(functools.partial(_hook_batched, name=name))
             for name, mod in named_linears.items()
         ]
-        out = block(inps.to(device), **_to_device(layer_kwargs, device))[0]
+        out = _extract_hidden_states(block(inps.to(device), **_to_device(layer_kwargs, device)))
         for h in handles:
             h.remove()
         input_feat = {k: torch.cat(v, dim=0) for k, v in feat.items()}
@@ -156,7 +163,7 @@ def collect_block_input_feat_and_output(
         ]
         outputs = []
         for inp, kw in zip(inps, layer_kwargs):
-            out = block(inp.to(device), **_to_device(kw, device))[0]
+            out = _extract_hidden_states(block(inp.to(device), **_to_device(kw, device)))
             outputs.append(out)
         for h in handles:
             h.remove()
@@ -231,11 +238,11 @@ def run_block(
     device = next(block.parameters()).device
 
     if isinstance(inps, torch.Tensor):
-        out = block(inps.to(device), **_to_device(layer_kwargs, device))[0]
+        out = _extract_hidden_states(block(inps.to(device), **_to_device(layer_kwargs, device)))
         return out, layer_kwargs
     else:
         outputs = [
-            block(inp.to(device), **_to_device(kw, device))[0]
+            _extract_hidden_states(block(inp.to(device), **_to_device(kw, device)))
             for inp, kw in zip(inps, layer_kwargs)
         ]
         return outputs, layer_kwargs
