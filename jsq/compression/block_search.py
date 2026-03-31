@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 from loguru import logger
 
-from .collector import _to_device, _slice_kw_for_sample
+from .collector import _extract_hidden_states, _to_device, _slice_kw_for_sample
 from .passes.base import CompressionPass
 
 
@@ -334,7 +334,7 @@ class BlockSearcher:
                 else [layer_kwargs] * n_use
             )
             return [
-                block(inp.to(device), **_to_device(kw, device))[0]
+                _extract_hidden_states(block(inp.to(device), **_to_device(kw, device)))
                 for inp, kw in zip(inps[:n_use], kw_iter)
             ]
 
@@ -348,7 +348,7 @@ class BlockSearcher:
             # Disable KV cache to avoid shape mismatch from StaticCache/HybridCache
             kw_i["past_key_values"] = None
             kw_i["use_cache"] = False
-            out = block(inp_i, **_to_device(kw_i, device))[0]
+            out = _extract_hidden_states(block(inp_i, **_to_device(kw_i, device)))
             outputs.append(out.cpu())  # keep on CPU to save GPU memory
         return torch.cat(outputs, dim=0)
 

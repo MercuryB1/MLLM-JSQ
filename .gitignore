@@ -8,6 +8,7 @@ __pycache__/
 
 # Output checkpoints
 outputs/
+submissions/
 
 # Datasets & cache
 storage/

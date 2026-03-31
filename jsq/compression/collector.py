@@ -50,6 +50,13 @@ def _to_device(kwargs: Dict, device) -> Dict:
     return result
 
 
+def _extract_hidden_states(layer_out):
+    """Extract hidden states from decoder layer outputs across return formats."""
+    if isinstance(layer_out, (tuple, list)):
+        return layer_out[0]
+    return layer_out
+
+
 def _slice_kw_for_sample(kwargs: Dict, idx: int, batch_size: int) -> Dict:
     """Extract kwargs for a single sample index from a batched kwargs dict.
 
@@ -187,7 +194,7 @@ def collect_block_input_feat_and_output(
             kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
             kw_i["past_key_values"] = None
             kw_i["use_cache"] = False
-            out_i = block(inp_i, **_to_device(kw_i, device))[0]
+            out_i = _extract_hidden_states(block(inp_i, **_to_device(kw_i, device)))
             outputs.append(out_i.detach().cpu())
         for h in handles:
             h.remove()
@@ -202,7 +209,7 @@ def collect_block_input_feat_and_output(
         ]
         outputs = []
         for inp, kw in zip(inps, layer_kwargs):
-            out = block(inp.to(device), **_to_device(kw, device))[0]
+            out = _extract_hidden_states(block(inp.to(device), **_to_device(kw, device)))
             outputs.append(out)
         for h in handles:
             h.remove()
@@ -290,12 +297,12 @@ def run_block(
             kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
             kw_i["past_key_values"] = None
             kw_i["use_cache"] = False
-            out_i = block(inp_i, **_to_device(kw_i, device))[0]
+            out_i = _extract_hidden_states(block(inp_i, **_to_device(kw_i, device)))
             outputs.append(out_i.detach().cpu())
         return torch.cat(outputs, dim=0), layer_kwargs
     else:
         outputs = [
-            block(inp.to(device), **_to_device(kw, device))[0]
+            _extract_hidden_states(block(inp.to(device), **_to_device(kw, device)))
             for inp, kw in zip(inps, layer_kwargs)
         ]
         return outputs, layer_kwargs
