@@ -48,6 +48,34 @@ class CompressionPipeline:
             and config.sparsity_ratio > 0.0
         )
 
+    @staticmethod
+    def _build_flat_vision_mask(
+        vision_masks: Optional[List],
+        inps,
+    ) -> Optional[torch.Tensor]:
+        """Concatenate per-sample vision masks into a flat [total_tokens] bool tensor.
+
+        Returns None if vision_masks is not available or all-None.
+        """
+        if vision_masks is None:
+            return None
+        if not isinstance(inps, list):
+            return None
+
+        parts: List[torch.Tensor] = []
+        for idx, inp in enumerate(inps):
+            n_tok = inp.reshape(-1, inp.shape[-1]).shape[0]
+            m = vision_masks[idx] if idx < len(vision_masks) else None
+            if m is None:
+                parts.append(torch.zeros(n_tok, dtype=torch.bool))
+            else:
+                if m.shape[0] != n_tok:
+                    parts.append(torch.zeros(n_tok, dtype=torch.bool))
+                else:
+                    parts.append(m.bool())
+        flat = torch.cat(parts, dim=0)
+        return flat if flat.any() else None
+
     @torch.no_grad()
     def run(
         self,
@@ -104,8 +132,14 @@ class CompressionPipeline:
             else:
                 # Direct mode: collect feat, apply passes, then forward
                 input_feat = collect_block_input_feat(block, inps, layer_kwargs)
+                # Build flat vision mask for modality-aware pruning (v4)
+                flat_vmask = self._build_flat_vision_mask(vision_masks, inps)
                 for pass_ in self.passes:
-                    pass_.apply(block, input_feat, self.adapter, config)
+                    if hasattr(pass_, '_supports_per_layer'):
+                        pass_.apply(block, input_feat, self.adapter, config,
+                                    vision_mask=flat_vmask)
+                    else:
+                        pass_.apply(block, input_feat, self.adapter, config)
                 next_inps, layer_kwargs = run_block(block, inps, layer_kwargs)
 
             inps = next_inps

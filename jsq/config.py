@@ -15,7 +15,7 @@ class CompressConfig:
     seed: int = 42
 
     # Pruning
-    pruning_method: str = "jsq_v1"  # jsq_v1 / jsq_v2 / jsq_v3 / wanda / magnitude / none
+    pruning_method: str = "jsq_v1"  # jsq_v1 / jsq_v2 / jsq_v3 / jsq_v4 / wanda / magnitude / none
     sparsity_ratio: float = 0.0
     sparsity_type: str = "unstructured"  # unstructured / 2:4 / 4:8
     rho: float = 2.1
