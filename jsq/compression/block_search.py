@@ -333,10 +333,13 @@ class BlockSearcher:
                 if isinstance(layer_kwargs, list)
                 else [layer_kwargs] * n_use
             )
-            return [
-                block(inp.to(device), **_to_device(kw, device))[0]
-                for inp, kw in zip(inps[:n_use], kw_iter)
-            ]
+            outputs = []
+            for inp, kw in zip(inps[:n_use], kw_iter):
+                x = inp.to(device)
+                if x.dim() == 2:
+                    x = x.unsqueeze(0)
+                outputs.append(block(x, **_to_device(kw, device))[0])
+            return outputs
 
         # Text mode: one sample at a time
         n_use = min(n_use, inps.shape[0])
