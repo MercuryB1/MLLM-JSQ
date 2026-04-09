@@ -8,9 +8,15 @@ from loguru import logger
 
 
 def _get_pileval(tokenizer, n_samples: int, seq_len: int, seed: int) -> torch.Tensor:
-    dataset = load_dataset(
-        "mit-han-lab/pile-val-backup", split="validation"
-    )
+    try:
+        dataset = load_dataset(
+            "mit-han-lab/pile-val-backup", split="validation"
+        )
+    except ValueError:
+        dataset = load_dataset(
+            "mit-han-lab/pile-val-backup", split="validation",
+            download_mode="force_redownload",
+        )
     random.seed(seed)
     samples: List[torch.Tensor] = []
     for _ in range(n_samples):

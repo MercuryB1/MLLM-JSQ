@@ -46,7 +46,7 @@ def parse_args() -> CompressConfig:
 
     # Pruning
     parser.add_argument("--pruning_method", type=str, default="jsq_v1",
-                        choices=["jsq_v1", "jsq_v2", "wanda", "magnitude", "none"],
+                        choices=["jsq_v1", "jsq_v2", "jsq_v3", "wanda", "magnitude", "none"],
                         help="Pruning metric")
     parser.add_argument("--sparsity_ratio", type=float, default=0.0,
                         help="Target sparsity (0.0 = no pruning)")
@@ -54,6 +54,12 @@ def parse_args() -> CompressConfig:
                         choices=["unstructured", "2:4", "4:8"])
     parser.add_argument("--rho", type=float, default=2.1,
                         help="JSQ sensitivity weight (rho in the paper)")
+    parser.add_argument("--alpha", type=float, default=0.5,
+                        help="JSQ v3: token density weighting strength (0 = standard WANDA)")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="JSQ v3: quantization damage penalty (0 = no quant-awareness)")
+    parser.add_argument("--top_k", type=int, default=3,
+                        help="JSQ v3: top-k outlier positions to penalize per row")
 
     # Quantization
     parser.add_argument("--w_bits", type=int, default=8)
@@ -69,6 +75,10 @@ def parse_args() -> CompressConfig:
     parser.add_argument("--smooth_alpha", type=float, default=0.8)
 
     # MA-JSQ block search
+    parser.add_argument("--search_method", type=str, default="none",
+                        choices=["none", "candidate", "owl", "greedy_sequential"],
+                        help="Block-level sparsity search strategy "
+                             "(none = uniform, no search overhead)")
     parser.add_argument("--gamma", type=float, default=1.0,
                         help="Modal balance factor γ: weight for text-token error "
                              "vs vision-token error in the block reconstruction loss "
@@ -115,12 +125,16 @@ def parse_args() -> CompressConfig:
         sparsity_ratio=args.sparsity_ratio,
         sparsity_type=args.sparsity_type,
         rho=args.rho,
+        alpha=args.alpha,
+        beta=args.beta,
+        top_k=args.top_k,
         w_bits=args.w_bits,
         a_bits=args.a_bits,
         weight_quant=args.weight_quant,
         act_quant=args.act_quant,
         quantize_bmm_input=not args.no_quantize_bmm_input,
         smooth_alpha=args.smooth_alpha,
+        search_method=args.search_method,
         gamma=args.gamma,
         n_search_candidates=args.n_search_candidates,
         eval_ppl=args.eval_ppl,

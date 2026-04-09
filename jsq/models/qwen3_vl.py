@@ -12,7 +12,7 @@ Note: Qwen3-VL attention uses QK-norm (q_norm, k_norm) but these are
       applied after projection, so smooth_pairs targets q_proj/k_proj/v_proj
       as usual.
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -50,9 +50,39 @@ class Qwen3VLAdapter(ModelAdapter):
              [mlp.gate_proj, mlp.up_proj]),
         ]
 
+    def get_vision_token_mask(
+        self, calib_samples, processor=None
+    ) -> Optional[List[torch.Tensor]]:
+        """Extract per-sample vision token masks from <|image_pad|> positions."""
+        if not isinstance(calib_samples, list):
+            return None
+
+        image_pad_id = 151655  # <|image_pad|> default in Qwen VL tokenizers
+        if processor is not None:
+            tok = getattr(processor, "tokenizer", processor)
+            _id = tok.convert_tokens_to_ids("<|image_pad|>")
+            if _id not in (None, tok.unk_token_id):
+                image_pad_id = _id
+
+        masks: List[torch.Tensor] = []
+        for sample in calib_samples:
+            if not isinstance(sample, dict) or "input_ids" not in sample:
+                masks.append(None)
+                continue
+            ids = sample["input_ids"]
+            if isinstance(ids, torch.Tensor):
+                mask = ids.squeeze(0) == image_pad_id
+            else:
+                mask = torch.tensor([x == image_pad_id for x in ids], dtype=torch.bool)
+            masks.append(mask)
+
+        return masks if any(m is not None for m in masks) else None
+
     def run_forward_for_calibration(self, model: nn.Module, samples, **kwargs):
         if isinstance(samples, dict):
-            return model(**{k: v.to(next(model.parameters()).device)
-                            if isinstance(v, torch.Tensor) else v
+            dev = next(model.parameters()).device
+            return model(**{k: v.to(dev) if isinstance(v, torch.Tensor) else v
                             for k, v in samples.items()})
-        return model(samples.to(next(model.parameters()).device))
+        # Text-only: use embed_tokens device (ViT may be on CPU)
+        dev = model.model.language_model.embed_tokens.weight.device
+        return model(samples.to(dev))

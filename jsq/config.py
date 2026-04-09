@@ -15,10 +15,13 @@ class CompressConfig:
     seed: int = 42
 
     # Pruning
-    pruning_method: str = "jsq_v1"  # jsq_v1 / jsq_v2 / wanda / magnitude / none
+    pruning_method: str = "jsq_v1"  # jsq_v1 / jsq_v2 / jsq_v3 / wanda / magnitude / none
     sparsity_ratio: float = 0.0
     sparsity_type: str = "unstructured"  # unstructured / 2:4 / 4:8
     rho: float = 2.1
+    alpha: float = 0.5      # JSQ v3: token density weighting (0 = standard WANDA scale)
+    beta: float = 0.5       # JSQ v3: quantization damage penalty (0 = no quant-awareness)
+    top_k: int = 3          # JSQ v3: top-k outlier positions to penalize per row
 
     # Quantization
     w_bits: int = 8
@@ -40,6 +43,7 @@ class CompressConfig:
     data_dir: str = "storage/datasets"   # local directory for calibration datasets
 
     # MA-JSQ block search
+    search_method: str = "none"     # none / candidate / owl / greedy_sequential
     gamma: float = 1.0              # modal balance factor (vision vs text error weight)
     n_search_candidates: int = 8    # number of per-layer sparsity configs to evaluate
 
