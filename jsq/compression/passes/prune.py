@@ -1,5 +1,5 @@
-"""Pruning pass: JSQ v1/v2, WANDA, and Magnitude."""
-from typing import Dict, Optional
+"""Pruning pass: JSQ v1/v2/v3/v4, WANDA, and Magnitude."""
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -160,6 +160,131 @@ def _jsq_v3_metric(
     return base
 
 
+def _leave_one_out_sensitivity(
+    act: torch.Tensor, w_f: torch.Tensor, max_clamp: float = 100.0,
+) -> torch.Tensor:
+    """Leave-one-out output sensitivity via cross-covariance trick.
+
+    Args:
+        act: [N, cin] activation matrix (float32, on device).
+        w_f: [cout, cin] weight matrix (float32).
+        max_clamp: upper clamp for numerical stability.
+
+    Returns:
+        ss: [cout, cin] sensitivity scores.
+    """
+    N = act.shape[0]
+    if N == 0:
+        return torch.zeros_like(w_f)
+    out = act @ w_f.T                       # [N, cout]
+    out_c = out - out.mean(0, keepdim=True)
+    act_c = act - act.mean(0, keepdim=True)
+    var_out = (out_c ** 2).mean(0)          # [cout]
+    var_act = (act_c ** 2).mean(0)          # [cin]
+    cov = (out_c.T @ act_c) / N            # [cout, cin]
+    ss = (
+        var_out.unsqueeze(1)
+        - 2.0 * cov * w_f
+        + var_act.unsqueeze(0) * w_f.pow(2)
+    ).clamp(min=0.0).sqrt().clamp(max=max_clamp)
+    return ss
+
+
+def _jsq_v4_metric(
+    w: torch.Tensor,
+    inp: torch.Tensor,
+    nsamples: int,
+    vision_mask: Optional[torch.Tensor] = None,
+    rho: float = 2.1,
+    gamma: float = 1.0,
+    w_bits: int = 8,
+    max_tokens: int = 4096,
+) -> torch.Tensor:
+    """JSQ v4: joint quantization-aware + modality-split pruning metric.
+
+    Three innovations over WANDA/JSQ v1:
+
+    1. Quantization-aware importance: replace |W| with (|W| - |W - W_q|),
+       reflecting post-quantization contribution rather than raw magnitude.
+       W_q is per-channel absmax quantization: step = max(|W_row|) / (2^(b-1)-1).
+
+    2. Modality-split activation scale: S_vis + gamma * S_txt instead of
+       a single mixed S, so text channels get explicit gamma weighting
+       regardless of the (typically large) number of vision tokens.
+
+    3. Modality-split leave-one-out sensitivity: ss_vis + gamma * ss_txt,
+       same cross-covariance trick as JSQ v1 but computed per-modality.
+
+    Falls back to JSQ v1 behavior when vision_mask is None (text-only).
+
+    Args:
+        w: [cout, cin] weight matrix.
+        inp: activations (2D or 3D).
+        nsamples: number of calibration samples.
+        vision_mask: [total_tokens] bool (True = vision), or None.
+        rho: sensitivity weight.
+        gamma: text-modality balance factor (>1 upweights text).
+        w_bits: target quantization bit width.
+        max_tokens: max tokens for sensitivity matmul (memory cap).
+    """
+    act = inp.reshape(-1, inp.shape[-1]).float().to(w.device)
+    w_f = w.float()
+
+    # --- Component 1: Quantization-aware importance ---
+    q_max = 2 ** (w_bits - 1) - 1  # 127 for INT8
+    row_max = w_f.abs().max(dim=-1, keepdim=True)[0].clamp(min=1e-8)
+    step = row_max / q_max
+    w_q = (w_f / step).round() * step
+    # |W| - |W - W_q|: rewards weights whose quantized value is close to original
+    quant_imp = (w_f.abs() - (w_f - w_q).abs()).clamp(min=0.0)
+
+    # --- Component 2: Modality-split activation scale ---
+    has_modal_split = (
+        vision_mask is not None
+        and vision_mask.any()
+        and (~vision_mask).any()
+    )
+
+    if has_modal_split:
+        vm = vision_mask.to(act.device)
+        act_vis = act[vm]       # [n_vis, cin]
+        act_txt = act[~vm]      # [n_txt, cin]
+        s_vis = (act_vis.pow(2).sum(0) / nsamples).sqrt()   # [cin]
+        s_txt = (act_txt.pow(2).sum(0) / nsamples).sqrt()   # [cin]
+        scale = s_vis + gamma * s_txt                        # [cin]
+    else:
+        scale = (act.pow(2).sum(0) / nsamples).sqrt()        # [cin]
+
+    base = quant_imp * scale.unsqueeze(0)  # [cout, cin]
+
+    # --- Component 3: Modality-split sensitivity ---
+    if rho > 0:
+        if has_modal_split:
+            vm = vision_mask.to(act.device)
+            a_vis = act[vm]
+            a_txt = act[~vm]
+            # Subsample each modality independently
+            if a_vis.shape[0] > max_tokens:
+                st = (a_vis.shape[0] + max_tokens - 1) // max_tokens
+                a_vis = a_vis[::st].contiguous()
+            if a_txt.shape[0] > max_tokens:
+                st = (a_txt.shape[0] + max_tokens - 1) // max_tokens
+                a_txt = a_txt[::st].contiguous()
+            ss_vis = _leave_one_out_sensitivity(a_vis, w_f)
+            ss_txt = _leave_one_out_sensitivity(a_txt, w_f)
+            ss = ss_vis + gamma * ss_txt
+        else:
+            act_sub = act
+            if act_sub.shape[0] > max_tokens:
+                st = (act_sub.shape[0] + max_tokens - 1) // max_tokens
+                act_sub = act_sub[::st].contiguous()
+            ss = _leave_one_out_sensitivity(act_sub, w_f)
+
+        base = base + rho * ss.to(w.dtype)
+
+    return base
+
+
 def _jsq_v1_metric(
     w: torch.Tensor, inp: torch.Tensor, nsamples: int, rho: float,
     max_tokens: int = 4096,
@@ -272,6 +397,7 @@ class PruningPass(CompressionPass):
         adapter,
         config,
         per_layer_sparsity: Optional[Dict[str, float]] = None,
+        vision_mask: Optional[torch.Tensor] = None,
     ) -> None:
         if config.sparsity_ratio == 0.0 and config.prune_n == 0 and not per_layer_sparsity:
             return
@@ -321,6 +447,14 @@ class PruningPass(CompressionPass):
                     beta=config.beta,
                     w_bits=config.w_bits,
                     top_k=config.top_k,
+                )
+            elif config.pruning_method == "jsq_v4":
+                metric = _jsq_v4_metric(
+                    w.data, feat, nsamples,
+                    vision_mask=vision_mask,
+                    rho=config.rho,
+                    gamma=config.gamma,
+                    w_bits=config.w_bits,
                 )
             else:
                 raise ValueError(f"Unknown pruning_method: {config.pruning_method}")

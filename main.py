@@ -46,7 +46,7 @@ def parse_args() -> CompressConfig:
 
     # Pruning
     parser.add_argument("--pruning_method", type=str, default="jsq_v1",
-                        choices=["jsq_v1", "jsq_v2", "jsq_v3", "wanda", "magnitude", "none"],
+                        choices=["jsq_v1", "jsq_v2", "jsq_v3", "jsq_v4", "wanda", "magnitude", "none"],
                         help="Pruning metric")
     parser.add_argument("--sparsity_ratio", type=float, default=0.0,
                         help="Target sparsity (0.0 = no pruning)")
