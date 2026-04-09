@@ -202,7 +202,10 @@ def collect_block_input_feat_and_output(
         ]
         outputs = []
         for inp, kw in zip(inps, layer_kwargs):
-            out = block(inp.to(device), **_to_device(kw, device))[0]
+            x = inp.to(device)
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+            out = block(x, **_to_device(kw, device))[0]
             outputs.append(out)
         for h in handles:
             h.remove()
@@ -260,7 +263,10 @@ def collect_block_input_feat(
             for name, mod in named_linears.items()
         ]
         for inp, kw in zip(inps, layer_kwargs):
-            block(inp.to(device), **_to_device(kw, device))
+            x = inp.to(device)
+            if x.dim() == 2:
+                x = x.unsqueeze(0)  # [seq, h] → [1, seq, h]
+            block(x, **_to_device(kw, device))
         for h in handles:
             h.remove()
         result: Dict = {k: torch.cat(v, dim=0) for k, v in feat.items()}
@@ -294,8 +300,10 @@ def run_block(
             outputs.append(out_i.detach().cpu())
         return torch.cat(outputs, dim=0), layer_kwargs
     else:
-        outputs = [
-            block(inp.to(device), **_to_device(kw, device))[0]
-            for inp, kw in zip(inps, layer_kwargs)
-        ]
+        def _fwd(inp, kw):
+            x = inp.to(device)
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+            return block(x, **_to_device(kw, device))[0]
+        outputs = [_fwd(inp, kw) for inp, kw in zip(inps, layer_kwargs)]
         return outputs, layer_kwargs
