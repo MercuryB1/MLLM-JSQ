@@ -17,9 +17,6 @@ dependencies = [
 multimodal = [
     "Pillow>=10.0.0",
 ]
-eval = [
-    "lmms-eval @ git+https://github.com/EvolvingLMMs-Lab/lmms-eval.git",
-]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cuda" }
