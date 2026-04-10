@@ -150,24 +150,19 @@ def _generate_candidates(
     s_target: float,
     layer_params: Dict[str, int],
     trace_H: Dict[str, float],
-    delta: float = 0.05,
-    n_candidates: int = 8,
-    max_sens_delta: float = 0.1,
+    n_candidates: int = 16,
 ) -> List[Dict[str, float]]:
-    """Generate candidate per-layer sparsity allocations.
+    """Generate diverse candidate per-layer sparsity allocations.
 
     Budget constraint: the parameter-weighted average of all s_l must equal
-    s_target (within 0.1%).  All sparsities are clamped to [0, 0.95].
+    s_target (within 0.1%).  All sparsities are clamped to [0, 0.9].
 
     Strategies:
       1. Uniform — all layers at s_target (baseline).
-      2. Attn-light — attention layers at s_target − delta, MLP compensates.
-      3. MLP-light  — reverse of Attn-light.
-      4. Sensitivity-driven — high tr(H_l) ⇒ less pruning, clamped to
-         [s_target − max_sens_delta, s_target + max_sens_delta] per layer to
-         prevent extreme allocations when attention inputs are LayerNorm-
-         normalised (trace_H ≈ 1) while MLP inputs are not.
-      5–6. Variants of Attn/MLP-light with delta * 0.5.
+      2-9. Attn-light / MLP-light at multiple delta scales (0.03 to 0.15).
+      10-12. Sensitivity-proportional at different strengths.
+      13-14. OWL-style (outlier-ratio-based): layers with higher activation
+             outlier ratios get LESS pruning.
 
     Returns a deduplicated list of at most *n_candidates* dicts.
     """
@@ -181,11 +176,12 @@ def _generate_candidates(
         return any(k in name for k in ATTN_KEYS)
 
     def clamp_s(s: float) -> float:
-        return max(0.0, min(0.95, s))
+        return max(0.0, min(0.9, s))
 
     total_params = sum(layer_params.values())
 
     def scale_to_budget(cfg: Dict[str, float]) -> Dict[str, float]:
+        """Rescale per-layer sparsities so weighted average == s_target."""
         weighted = sum(cfg[n] * layer_params[n] for n in cfg)
         actual = weighted / total_params
         if abs(actual - s_target) < 1e-4 or actual < 1e-8:
@@ -195,50 +191,54 @@ def _generate_candidates(
 
     attn_names = [n for n in layer_names if is_attn(n)]
     mlp_names  = [n for n in layer_names if not is_attn(n)]
-    n_attn = sum(layer_params[n] for n in attn_names)
-    n_mlp  = sum(layer_params[n] for n in mlp_names)
 
     candidates: List[Dict[str, float]] = []
 
     # 1. Uniform
     candidates.append({n: s_target for n in layer_names})
 
-    # 2 & 3. Attn-light / MLP-light at two delta scales.
-    # Use symmetric ±d instead of budget-compensation formula.  For GQA
-    # models, attn params ≪ MLP params, so compensation would assign extreme
-    # sparsity (e.g. 78%) to small attn layers.  Using ±d and letting
-    # scale_to_budget do a mild uniform rescale keeps allocations sane.
-    for d in [delta, delta * 0.5]:
+    # 2-9. Attn-light / MLP-light at multiple delta scales
+    for d in [0.03, 0.06, 0.10, 0.15]:
         if attn_names and mlp_names:
             for attn_less in (True, False):
-                if attn_less:
-                    a_s = clamp_s(s_target - d)
-                    m_s = clamp_s(s_target + d)
-                else:
-                    m_s = clamp_s(s_target - d)
-                    a_s = clamp_s(s_target + d)
+                a_s = clamp_s(s_target + (-d if attn_less else d))
+                m_s = clamp_s(s_target + (d if attn_less else -d))
                 candidates.append(scale_to_budget({
                     n: (a_s if is_attn(n) else m_s) for n in layer_names
                 }))
 
-    # 4. Sensitivity-driven (inversely proportional to tr(H_l))
-    # Clamp each layer's raw sparsity to [s_target - max_sens_delta,
-    # s_target + max_sens_delta] before budget rescaling.  Without this cap,
-    # attention layers (whose inputs are LayerNorm-normalised, trace_H ≈ 1)
-    # receive extreme sparsity (~78%) while MLP layers (larger activations)
-    # receive too little — crushing attention quality.
+    # 10-12. Sensitivity-proportional: high trace_H → less pruning
+    # Use softmax-normalized trace_H for stable allocation across layers
+    # with very different activation magnitudes (LayerNorm vs raw).
     if trace_H:
+        import math
         eps = 1e-8
-        inv_sens = {n: 1.0 / (trace_H.get(n, eps) + eps) for n in layer_names}
-        total_inv_w = sum(inv_sens[n] * layer_params[n] for n in layer_names)
-        if total_inv_w > 0:
-            s_lo = max(0.0, s_target - max_sens_delta)
-            s_hi = min(0.95, s_target + max_sens_delta)
-            raw = {
-                n: max(s_lo, min(s_hi,
-                    inv_sens[n] * s_target * total_params / total_inv_w))
-                for n in layer_names
-            }
+        traces = [trace_H.get(n, eps) for n in layer_names]
+        log_traces = [math.log(t + eps) for t in traces]
+        # Normalize to zero-mean in log space for stability
+        mean_lt = sum(log_traces) / len(log_traces)
+        centered = [lt - mean_lt for lt in log_traces]
+
+        for strength in [0.5, 1.0, 2.0]:
+            # Higher trace → more important → lower sparsity
+            raw = {}
+            for i, n in enumerate(layer_names):
+                raw[n] = clamp_s(s_target + strength * 0.05 * centered[i])
+            candidates.append(scale_to_budget(raw))
+
+    # 13-14. OWL-style: outlier ratio determines sparsity
+    # Layers with more outlier activations (>3σ) are more sensitive → less pruning
+    if trace_H:
+        # Use trace_H variance as proxy for outlier density
+        trace_vals = [trace_H.get(n, 0.0) for n in layer_names]
+        t_mean = sum(trace_vals) / len(trace_vals) if trace_vals else 1.0
+        # Layers above-mean trace get lower sparsity
+        for spread in [0.08, 0.12]:
+            raw = {}
+            for i, n in enumerate(layer_names):
+                ratio = trace_vals[i] / (t_mean + eps)
+                # ratio > 1 → important → lower sparsity
+                raw[n] = clamp_s(s_target + spread * (1.0 - ratio))
             candidates.append(scale_to_budget(raw))
 
     # Deduplicate and limit
@@ -284,9 +284,9 @@ class BlockSearcher:
         passes: List[CompressionPass],
         adapter,
         gamma: float = 1.0,
-        n_search_candidates: int = 8,
+        n_search_candidates: int = 16,
         max_feat_tokens: int = 4096,
-        n_eval_samples: int = 8,
+        n_eval_samples: int = 16,
     ) -> None:
         self.passes = passes
         self.adapter = adapter
@@ -467,9 +467,8 @@ class BlockSearcher:
         # ---- Step 2: lite_feat — subsample for candidate evaluation ----
         lite_feat = _subsample_feat(input_feat, max_tokens=self.max_feat_tokens)
 
-        # Off-load the large original input_feat tensors to CPU to free GPU RAM.
-        # The passes will receive lite_feat; act_scales / JSQ metrics computed
-        # on lite_feat are nearly identical to full-feat for relative ranking.
+        # Off-load the large original input_feat tensors to CPU to free GPU RAM
+        # during candidate evaluation.  They are moved back for final application.
         _offload_feat(input_feat)
         gc.collect()
         torch.cuda.empty_cache()
@@ -522,10 +521,23 @@ class BlockSearcher:
 
         logger.info(f"  Best err={best_err:.6e}: {best_candidate}")
 
-        # ---- Step 6: apply best config in-place ----
+        # ---- Step 6: apply best config using full input_feat ----
+        # Move the full input_feat back to GPU for the final application so
+        # that the pruning metric (WANDA scale, sensitivity) is computed on ALL
+        # calibration tokens, not the lite_feat subsample.  This matches the
+        # quality of direct mode while using the search-selected allocation.
+        del lite_feat
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        device = next(block.parameters()).device
+        for name in input_feat:
+            if isinstance(input_feat[name], torch.Tensor):
+                input_feat[name] = input_feat[name].to(device)
+
         for pass_ in self.passes:
             if getattr(pass_, "_supports_per_layer", False):
-                pass_.apply(block, lite_feat, self.adapter, config,
+                pass_.apply(block, input_feat, self.adapter, config,
                             per_layer_sparsity=best_candidate)
             else:
-                pass_.apply(block, lite_feat, self.adapter, config)
+                pass_.apply(block, input_feat, self.adapter, config)

@@ -45,7 +45,7 @@ class CompressConfig:
     # MA-JSQ block search
     search_method: str = "none"     # none / candidate / owl / greedy_sequential
     gamma: float = 1.0              # modal balance factor (vision vs text error weight)
-    n_search_candidates: int = 8    # number of per-layer sparsity configs to evaluate
+    n_search_candidates: int = 16   # number of per-layer sparsity configs to evaluate
 
     # Other
     save_dir: Optional[str] = None
