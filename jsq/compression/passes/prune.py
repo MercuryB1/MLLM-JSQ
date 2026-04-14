@@ -235,6 +235,7 @@ def _jsq_v4_metric(
     # --- Component 1: Modality-split activation scale ---
     has_modal_split = (
         vision_mask is not None
+        and vision_mask.numel() == act.shape[0]
         and vision_mask.any()
         and (~vision_mask).any()
     )

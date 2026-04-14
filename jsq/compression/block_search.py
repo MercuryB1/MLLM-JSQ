@@ -396,6 +396,7 @@ class BlockSearcher:
         Y_orig_flat: torch.Tensor,
         H: torch.Tensor,
         vision_mask_flat: Optional[torch.Tensor],
+        vision_mask_for_metric: Optional[torch.Tensor] = None,
     ) -> float:
         device = next(block.parameters()).device
         block_copy = copy.deepcopy(block).to(device)
@@ -404,7 +405,7 @@ class BlockSearcher:
                 if getattr(pass_, "_supports_per_layer", False):
                     pass_.apply(block_copy, lite_feat, self.adapter, config,
                                 per_layer_sparsity=per_layer_sparsity,
-                                vision_mask=vision_mask_flat)
+                                vision_mask=vision_mask_for_metric)
                 else:
                     pass_.apply(block_copy, lite_feat, self.adapter, config)
 
@@ -492,8 +493,20 @@ class BlockSearcher:
         # and FP16 max is 65504, so Y²  overflows for deeper blocks.
         H = Y_orig_flat.float().pow(2)                # [tokens, hidden], FP32
 
-        # Vision mask aligned to the n_use samples used
+        # Two masks:
+        # - vision_mask_flat: aligned to n_use samples, used by _hessian_block_error
+        # - vision_mask_full: aligned to ALL calibration samples, used by final pruning
+        #   application (input_feat concatenates tokens from every sample).
+        # Candidate evaluation intentionally does NOT pass a mask: lite_feat is
+        # stride-subsampled per layer and cannot be aligned without extra bookkeeping.
+        # Modality split inside candidate eval is second-order — it only affects
+        # which per-layer sparsity *allocation* is picked, not the final mask used
+        # when the metric is recomputed on the full input_feat.
+        n_total = (
+            inps.shape[0] if isinstance(inps, torch.Tensor) else len(inps)
+        )
         vision_mask_flat = self._build_flat_vision_mask(vision_masks, n_use, inps)
+        vision_mask_full = self._build_flat_vision_mask(vision_masks, n_total, inps)
 
         # ---- Step 4: generate candidates ----
         candidates = _generate_candidates(
@@ -514,6 +527,7 @@ class BlockSearcher:
             err = self._evaluate_candidate(
                 block, lite_feat, inps, layer_kwargs, config,
                 cand, Y_orig_flat, H, vision_mask_flat,
+                vision_mask_for_metric=None,
             )
             logger.debug(f"  Candidate {idx}: err={err:.6e}")
             if err < best_err:
@@ -540,6 +554,6 @@ class BlockSearcher:
             if getattr(pass_, "_supports_per_layer", False):
                 pass_.apply(block, input_feat, self.adapter, config,
                             per_layer_sparsity=best_candidate,
-                            vision_mask=vision_mask_flat)
+                            vision_mask=vision_mask_full)
             else:
                 pass_.apply(block, input_feat, self.adapter, config)
