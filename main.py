@@ -46,7 +46,7 @@ def parse_args() -> CompressConfig:
 
     # Pruning
     parser.add_argument("--pruning_method", type=str, default="jsq_v1",
-                        choices=["jsq_v1", "jsq_v2", "jsq_v3", "jsq_v4", "wanda", "magnitude", "none"],
+                        choices=["jsq_v1", "jsq_v2", "jsq_v3", "jsq_v4", "jsq_v5", "wanda", "magnitude", "none"],
                         help="Pruning metric")
     parser.add_argument("--sparsity_ratio", type=float, default=0.0,
                         help="Target sparsity (0.0 = no pruning)")
@@ -60,6 +60,10 @@ def parse_args() -> CompressConfig:
                         help="JSQ v3: quantization damage penalty (0 = no quant-awareness)")
     parser.add_argument("--top_k", type=int, default=3,
                         help="JSQ v3: top-k outlier positions to penalize per row")
+    parser.add_argument("--pi_t", type=float, default=0.5,
+                        help="JSQ v5: text mixture weight in H (pi_v = 1 - pi_t)")
+    parser.add_argument("--lambda_floor", type=float, default=1e-3,
+                        help="JSQ v5: minimum regularizer in H = pi_t C_t + pi_v C_v + lam I")
 
     # Quantization
     parser.add_argument("--w_bits", type=int, default=8)
@@ -128,6 +132,8 @@ def parse_args() -> CompressConfig:
         alpha=args.alpha,
         beta=args.beta,
         top_k=args.top_k,
+        pi_t=args.pi_t,
+        lambda_floor=args.lambda_floor,
         w_bits=args.w_bits,
         a_bits=args.a_bits,
         weight_quant=args.weight_quant,
