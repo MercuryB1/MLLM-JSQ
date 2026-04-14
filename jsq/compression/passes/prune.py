@@ -279,6 +279,85 @@ def _jsq_v4_metric(
     return base
 
 
+def _jsq_v5_metric(
+    w: torch.Tensor,
+    inp: torch.Tensor,
+    vision_mask: Optional[torch.Tensor] = None,
+    pi_t: float = 0.5,
+    lambda_floor: float = 1e-3,
+    max_tokens: int = 4096,
+    w_bits_act: int = 8,
+) -> torch.Tensor:
+    """JSQ v5: mixture-Hessian OBS importance.
+
+    I(i, j) = W_ij^2 / [H^-1]_jj,
+    H = pi_t * X_t^T X_t + pi_v * X_v^T X_v + lam * I.
+
+    lam absorbs per-token activation quantization variance (sigma_A^2) plus a
+    small Ledoit-Wolf shrinkage, both estimated on the fly from X. No explicit
+    OBS compensation is applied; downstream Smooth/Clip/Quantize passes run
+    as usual.
+
+    Text-only mode (vision_mask None or all-one-modality) degenerates to
+    single-H SparseGPT-style scoring.
+
+    Args:
+        w: [cout, cin] weight.
+        inp: activations, 2D [tokens, cin] or 3D [nsamples, seq, cin].
+        vision_mask: [tokens] bool, True = vision. None => all text.
+        pi_t: text mixture weight; pi_v = 1 - pi_t.
+        lambda_floor: minimum regularizer (numerical stability).
+        max_tokens: per-modality token cap for Hessian construction.
+        w_bits_act: activation bitwidth used to estimate sigma_A^2.
+
+    Returns:
+        metric: [cout, cin] importance score (higher = more important).
+    """
+    from ..hessian_utils import mixture_hinv_diag, estimate_lam
+
+    act = inp.reshape(-1, inp.shape[-1]).float().to(w.device)
+    n_tok = act.shape[0]
+
+    if vision_mask is not None and vision_mask.numel() == n_tok:
+        vm = vision_mask.to(act.device).bool()
+        if vm.all() or (~vm).all():
+            x_t, x_v = act, None
+        else:
+            x_t = act[~vm]
+            x_v = act[vm]
+    else:
+        x_t, x_v = act, None
+
+    pi_v = 1.0 - pi_t
+    if x_v is None:
+        pi_t_eff, pi_v_eff = 1.0, 0.0
+    elif x_t is None or x_t.shape[0] == 0:
+        pi_t_eff, pi_v_eff = 0.0, 1.0
+    else:
+        pi_t_eff, pi_v_eff = pi_t, pi_v
+
+    # Per-modality lambda, then mix to match H's own mixture weights.
+    # lam matches per-token-variance scale (since H uses X^T X / n_mod).
+    lam_parts = []
+    if pi_t_eff > 0 and x_t is not None and x_t.shape[0] > 0:
+        lam_parts.append(pi_t_eff * estimate_lam(x_t, w_bits_act=w_bits_act, floor=0.0))
+    if pi_v_eff > 0 and x_v is not None and x_v.shape[0] > 0:
+        lam_parts.append(pi_v_eff * estimate_lam(x_v, w_bits_act=w_bits_act, floor=0.0))
+    lam = max(sum(lam_parts), lambda_floor)
+
+    hinv_diag = mixture_hinv_diag(
+        x_t=x_t, x_v=x_v,
+        pi_t=pi_t_eff, pi_v=pi_v_eff, lam=lam,
+        max_rows=max_tokens,
+        device=w.device, dtype=torch.float32,
+    )  # [cin]
+
+    # I(i, j) = W_ij^2 / [H^-1]_jj. Keep in fp32 to avoid fp16 overflow on
+    # large W^2 / small hinv_diag; downstream _apply_mask only needs ordering.
+    importance = w.float().pow(2) / hinv_diag.unsqueeze(0).clamp(min=1e-12)
+    return importance
+
+
 def _jsq_v1_metric(
     w: torch.Tensor, inp: torch.Tensor, nsamples: int, rho: float,
     max_tokens: int = 4096,
@@ -449,6 +528,14 @@ class PruningPass(CompressionPass):
                     rho=config.rho,
                     gamma=config.gamma,
                     w_bits=config.w_bits,
+                )
+            elif config.pruning_method == "jsq_v5":
+                metric = _jsq_v5_metric(
+                    w.data, feat,
+                    vision_mask=vision_mask,
+                    pi_t=config.pi_t,
+                    lambda_floor=config.lambda_floor,
+                    w_bits_act=config.a_bits,
                 )
             else:
                 raise ValueError(f"Unknown pruning_method: {config.pruning_method}")

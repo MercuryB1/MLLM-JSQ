@@ -403,7 +403,8 @@ class BlockSearcher:
             for pass_ in self.passes:
                 if getattr(pass_, "_supports_per_layer", False):
                     pass_.apply(block_copy, lite_feat, self.adapter, config,
-                                per_layer_sparsity=per_layer_sparsity)
+                                per_layer_sparsity=per_layer_sparsity,
+                                vision_mask=vision_mask_flat)
                 else:
                     pass_.apply(block_copy, lite_feat, self.adapter, config)
 
@@ -538,6 +539,7 @@ class BlockSearcher:
         for pass_ in self.passes:
             if getattr(pass_, "_supports_per_layer", False):
                 pass_.apply(block, input_feat, self.adapter, config,
-                            per_layer_sparsity=best_candidate)
+                            per_layer_sparsity=best_candidate,
+                            vision_mask=vision_mask_flat)
             else:
                 pass_.apply(block, input_feat, self.adapter, config)

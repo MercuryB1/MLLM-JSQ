@@ -15,13 +15,16 @@ class CompressConfig:
     seed: int = 42
 
     # Pruning
-    pruning_method: str = "jsq_v1"  # jsq_v1 / jsq_v2 / jsq_v3 / jsq_v4 / wanda / magnitude / none
+    pruning_method: str = "jsq_v1"  # jsq_v1..v5 / wanda / magnitude / none
     sparsity_ratio: float = 0.0
     sparsity_type: str = "unstructured"  # unstructured / 2:4 / 4:8
     rho: float = 2.1
     alpha: float = 0.5      # JSQ v3: token density weighting (0 = standard WANDA scale)
     beta: float = 0.5       # JSQ v3: quantization damage penalty (0 = no quant-awareness)
     top_k: int = 3          # JSQ v3: top-k outlier positions to penalize per row
+    # JSQ v5: mixture-Hessian OBS metric
+    pi_t: float = 0.5           # text mixture weight; pi_v = 1 - pi_t
+    lambda_floor: float = 1e-3  # minimum regularizer in H = pi_t H_t + pi_v H_v + lam I
 
     # Quantization
     w_bits: int = 8
