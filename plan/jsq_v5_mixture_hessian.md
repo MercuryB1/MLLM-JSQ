@@ -227,14 +227,14 @@ Qwen2-VL-7B @ sparsity 0.4375 + W8A8 的目标指标：
 ## 11. 实现 Checklist
 
 - [ ] §8 前置实验：测量每模态 Hessian 的子空间夹角
-- [ ] `jsq/compression/collector.py` 加 `σ_A²` 收集器
-- [ ] `jsq/compression/passes/prune.py` 实现 `_jsq_v5_metric`
-- [ ] 新文件 `jsq/compression/hessian_utils.py`（<150 行）实现 Woodbury 对角求解器
-- [ ] prune pass 里 dispatch `jsq_v5`
-- [ ] 配置加 `pi_t`、`pi_v`、`lambda_floor`
-- [ ] 修复 pileval 缓存问题（blocker，与 v5 无关）
-- [ ] 跑 `python main.py ... --pruning_method jsq_v5 --pi_t 0.5`
-- [ ] Ablation：`π_t ∈ {0.3, 0.5, 0.7}`
+- [x] `jsq/compression/collector.py` 加 `σ_A²` 收集器
+- [x] `jsq/compression/passes/prune.py` 实现 `_jsq_v5_metric`
+- [x] 新文件 `jsq/compression/hessian_utils.py`（<150 行）实现 Woodbury 对角求解器
+- [x] prune pass 里 dispatch `jsq_v5`
+- [x] 配置加 `pi_t`、`pi_v`、`lambda_floor`
+- [x] 跑 `python main.py ... --pruning_method jsq_v5 --pi_t 0.5`
+- [x] Ablation：`π_t ∈ {0.3, 0.5, 0.7}` → A2 (π_t=0.3) 最优，MME_cog 625 已达目标（见 `exp_v5_sweep_20260414.md`）
+- [ ] **P0: 修 block_search vision_mask 传递**（F3，见 `exp_v5_next_steps_20260414.md`） — blocking B 组增益
 - [ ] Ablation：v5 vs v5-without-σ_A²（分离量化噪声贡献）
 - [ ] Ablation：mixture-H vs single-H-token-weighted（验证子空间假设）
 - [ ] 评测：MME / MMStar / MMBench / SEED-Bench / PPL
