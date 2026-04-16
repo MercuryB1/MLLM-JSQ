@@ -90,6 +90,18 @@ def parse_args() -> CompressConfig:
     parser.add_argument("--n_search_candidates", type=int, default=8,
                         help="Number of per-layer sparsity configs to evaluate per block "
                              "(MA-JSQ block search)")
+    parser.add_argument("--block_alloc_method", type=str, default="uniform",
+                        choices=["uniform", "bi_mixture", "bi_text", "bi_vision"],
+                        help="Per-block sparsity allocation (Option E). "
+                             "uniform = every block gets sparsity_ratio. "
+                             "bi_mixture = pi_t*BI_t + pi_v*BI_v; bi_text / bi_vision = single modality.")
+    parser.add_argument("--block_alloc_alpha", type=float, default=1.0,
+                        help="Inverse-sensitivity exponent in per-block allocation "
+                             "(larger = more spread)")
+    parser.add_argument("--block_alloc_s_min", type=float, default=0.1,
+                        help="Per-block minimum sparsity clip")
+    parser.add_argument("--block_alloc_s_max", type=float, default=0.7,
+                        help="Per-block maximum sparsity clip")
 
     # Evaluation
     parser.add_argument("--eval_only", action="store_true",
@@ -143,6 +155,10 @@ def parse_args() -> CompressConfig:
         search_method=args.search_method,
         gamma=args.gamma,
         n_search_candidates=args.n_search_candidates,
+        block_alloc_method=args.block_alloc_method,
+        block_alloc_alpha=args.block_alloc_alpha,
+        block_alloc_s_min=args.block_alloc_s_min,
+        block_alloc_s_max=args.block_alloc_s_max,
         eval_ppl=args.eval_ppl,
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,

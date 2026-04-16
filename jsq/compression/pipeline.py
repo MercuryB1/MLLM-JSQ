@@ -13,9 +13,14 @@ from loguru import logger
 from tqdm import tqdm
 
 from .block_search import BlockSearcher
+from .block_vl_allocator import (
+    allocate_per_block_sparsity,
+    summarize_allocation,
+)
 from .collector import (
     collect_block_input_feat,
     collect_block_input_feat_and_output,
+    collect_block_sensitivity,
     collect_first_layer_inputs,
     run_block,
 )
@@ -111,6 +116,35 @@ class CompressionPipeline:
         else:
             logger.info(f"Captured inputs: {len(inps)} multimodal samples")
 
+        # Optional: per-block sparsity allocation (Option E).
+        per_block_sparsity: Optional[List[float]] = None
+        alloc_method = getattr(config, "block_alloc_method", "uniform")
+        if (
+            alloc_method != "uniform"
+            and config.sparsity_ratio > 0.0
+            and not use_search
+        ):
+            logger.info(
+                f"Running block sensitivity pre-pass (method={alloc_method})..."
+            )
+            bi_t, bi_v = collect_block_sensitivity(
+                blocks, inps, layer_kwargs, vision_masks=vision_masks, device=device,
+            )
+            per_block_sparsity = allocate_per_block_sparsity(
+                bi_t, bi_v,
+                pi_t=config.pi_t,
+                target=config.sparsity_ratio,
+                alpha=config.block_alloc_alpha,
+                s_min=config.block_alloc_s_min,
+                s_max=config.block_alloc_s_max,
+                method=alloc_method,
+            )
+            logger.info("Per-block sparsity:\n" + summarize_allocation(per_block_sparsity))
+            for li, s_l in enumerate(per_block_sparsity):
+                logger.info(
+                    f"  block {li}: s={s_l:.3f} BI_t={bi_t[li]:.4f} BI_v={bi_v[li]:.4f}"
+                )
+
         for i, block in enumerate(tqdm(blocks, desc="Compressing blocks")):
             block.to(device)
 
@@ -134,12 +168,19 @@ class CompressionPipeline:
                 input_feat = collect_block_input_feat(block, inps, layer_kwargs)
                 # Build flat vision mask for modality-aware pruning (v4)
                 flat_vmask = self._build_flat_vision_mask(vision_masks, inps)
+                # Optional per-block sparsity override (Option E)
+                block_sparsity_dict: Optional[dict] = None
+                if per_block_sparsity is not None:
+                    s_l = per_block_sparsity[i]
+                    linears = self.adapter.get_named_linears(block)
+                    block_sparsity_dict = {name: s_l for name in linears}
                 for pass_ in self.passes:
-                    if hasattr(pass_, '_supports_per_layer'):
-                        pass_.apply(block, input_feat, self.adapter, config,
-                                    vision_mask=flat_vmask)
-                    else:
-                        pass_.apply(block, input_feat, self.adapter, config)
+                    kw = {}
+                    if hasattr(pass_, "_supports_per_layer"):
+                        kw["vision_mask"] = flat_vmask
+                        if block_sparsity_dict is not None:
+                            kw["per_layer_sparsity"] = block_sparsity_dict
+                    pass_.apply(block, input_feat, self.adapter, config, **kw)
                 next_inps, layer_kwargs = run_block(block, inps, layer_kwargs)
 
             inps = next_inps

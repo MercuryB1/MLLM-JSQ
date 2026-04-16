@@ -50,6 +50,12 @@ class CompressConfig:
     gamma: float = 1.0              # modal balance factor (vision vs text error weight)
     n_search_candidates: int = 16   # number of per-layer sparsity configs to evaluate
 
+    # JSQ v5 Option E: per-block multimodal sparsity allocation
+    block_alloc_method: str = "uniform"    # uniform / bi_mixture / bi_text / bi_vision
+    block_alloc_alpha: float = 1.0         # inverse-sensitivity exponent
+    block_alloc_s_min: float = 0.1         # per-block sparsity clip (low)
+    block_alloc_s_max: float = 0.7         # per-block sparsity clip (high)
+
     # Other
     save_dir: Optional[str] = None
     multigpu: bool = False

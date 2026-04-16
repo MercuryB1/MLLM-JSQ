@@ -1,10 +1,11 @@
 """Utilities for collecting layer inputs during calibration."""
 import functools
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from loguru import logger
 
 
 class Catcher(nn.Module):
@@ -272,6 +273,92 @@ def collect_block_input_feat(
         result: Dict = {k: torch.cat(v, dim=0) for k, v in feat.items()}
         result["__nsamples__"] = len(inps)
         return result
+
+
+@torch.no_grad()
+def collect_block_sensitivity(
+    blocks: List[nn.Module],
+    inps,
+    layer_kwargs,
+    vision_masks: Optional[List] = None,
+    device: Optional[torch.device] = None,
+) -> Tuple[List[float], List[float]]:
+    """Uncompressed forward pass through all blocks; compute per-block BI_t / BI_v.
+
+    Block Influence (BI) per modality m:
+        BI_m[l] = mean_{i in m} (1 - cos(x_i, y_i))
+    computed from the inputs x and outputs y of block l.
+
+    In text mode (inps is Tensor), vision_masks is ignored → BI_t only.
+    In multimodal mode (inps is List[Tensor]), modality split follows
+    vision_masks[s] (per-sample [seq] bool). Samples whose vision_mask is
+    missing/mismatched are counted as text.
+
+    Blocks are moved to device one at a time and returned to CPU afterwards.
+    inps is consumed forward-by-forward; a fresh copy is produced per block
+    and original *inps* is not mutated.
+
+    Returns:
+        (bi_t, bi_v) — each a list of length len(blocks), one float per block.
+    """
+    from .block_vl_allocator import block_influence_split, aggregate_sample_bi
+
+    n_blocks = len(blocks)
+    bi_t: List[float] = [0.0] * n_blocks
+    bi_v: List[float] = [0.0] * n_blocks
+
+    is_multimodal = not isinstance(inps, torch.Tensor)
+    current = inps
+
+    for li, block in enumerate(blocks):
+        tgt_dev = device if device is not None else next(block.parameters()).device
+        block.to(tgt_dev)
+
+        per_sample_stats: List[Tuple[float, float, int, int]] = []
+
+        if is_multimodal:
+            outputs: List[torch.Tensor] = []
+            for s_idx, (inp, kw) in enumerate(zip(current, layer_kwargs)):
+                x = inp.to(tgt_dev)
+                if x.dim() == 2:
+                    x = x.unsqueeze(0)
+                y = block(x, **_to_device(kw, tgt_dev))[0]
+                x_flat = x.reshape(-1, x.shape[-1])
+                y_flat = y.reshape(-1, y.shape[-1])
+                vm = None
+                if vision_masks is not None and s_idx < len(vision_masks):
+                    m = vision_masks[s_idx]
+                    if m is not None:
+                        vm = m
+                stats = block_influence_split(x_flat, y_flat, vm)
+                per_sample_stats.append(stats)
+                outputs.append(y.detach())
+            next_inps = outputs
+        else:
+            batch_size = current.shape[0]
+            outputs = []
+            for i in range(batch_size):
+                inp_i = current[i: i + 1].to(tgt_dev)
+                kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
+                kw_i["past_key_values"] = None
+                kw_i["use_cache"] = False
+                y = block(inp_i, **_to_device(kw_i, tgt_dev))[0]
+                x_flat = inp_i.reshape(-1, inp_i.shape[-1])
+                y_flat = y.reshape(-1, y.shape[-1])
+                stats = block_influence_split(x_flat, y_flat, None)
+                per_sample_stats.append(stats)
+                outputs.append(y.detach().cpu())
+            next_inps = torch.cat(outputs, dim=0)
+
+        bt, bv = aggregate_sample_bi(per_sample_stats)
+        bi_t[li], bi_v[li] = bt, bv
+        logger.info(f"block {li}: BI_t={bt:.4f} BI_v={bv:.4f}")
+
+        current = next_inps
+        block.cpu()
+        torch.cuda.empty_cache()
+
+    return bi_t, bi_v
 
 
 @torch.no_grad()
