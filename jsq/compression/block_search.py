@@ -77,6 +77,36 @@ def _offload_feat(input_feat: Dict[str, torch.Tensor]) -> None:
             input_feat[name] = input_feat[name].cpu()
 
 
+def _subsample_vision_mask(
+    full_mask: Optional[torch.Tensor],
+    n_feat_tokens: int,
+    max_tokens: int = 4096,
+) -> Optional[torch.Tensor]:
+    """Subsample a token-aligned vision mask with the same stride logic as
+    ``_subsample_feat``.
+
+    Args:
+        full_mask: [total_tokens] bool mask over the full input_feat.  ``None``
+            means no mask available (text-only or no mixed modalities).
+        n_feat_tokens: token count of the full per-layer feat (before subsample).
+        max_tokens: stride target; must match ``_subsample_feat.max_tokens``.
+
+    Returns:
+        ``None`` when the input mask is ``None`` or its length does not match
+        ``n_feat_tokens`` (safer to fall back than misalign).  Otherwise a
+        contiguous 1-D bool tensor of length ``min(n_feat_tokens, max_tokens)``.
+    """
+    if full_mask is None:
+        return None
+    m = full_mask.reshape(-1).bool()
+    if m.shape[0] != n_feat_tokens:
+        return None
+    if n_feat_tokens > max_tokens:
+        step = max(1, n_feat_tokens // max_tokens)
+        m = m[::step][:max_tokens]
+    return m.contiguous()
+
+
 # ---------------------------------------------------------------------------
 # Error helpers
 # ---------------------------------------------------------------------------
@@ -462,6 +492,17 @@ class BlockSearcher:
         layer_names   = list(named_linears.keys())
         layer_params  = {n: l.weight.numel() for n, l in named_linears.items()}
 
+        # v5 analytic fast path: allocation is solved in closed form from the
+        # v5 metric itself — no block forward, no Fisher proxy.  Eliminates the
+        # F6 objective mismatch and cuts per-block search cost from minutes to
+        # milliseconds.  Other pruning methods keep the Fisher-proxy pipeline.
+        if config.pruning_method == "jsq_v5":
+            self._analytic_search_and_apply_v5(
+                block, input_feat, layer_names, layer_params,
+                config, vision_masks, inps,
+            )
+            return
+
         # ---- Step 1: cheap statistics from the full input_feat ----
         # trace_H computed in fp16 chunks — no large fp32 copy needed
         trace_H = _compute_layer_trace_H(input_feat)
@@ -493,20 +534,43 @@ class BlockSearcher:
         # and FP16 max is 65504, so Y²  overflows for deeper blocks.
         H = Y_orig_flat.float().pow(2)                # [tokens, hidden], FP32
 
-        # Two masks:
+        # Three masks:
         # - vision_mask_flat: aligned to n_use samples, used by _hessian_block_error
         # - vision_mask_full: aligned to ALL calibration samples, used by final pruning
         #   application (input_feat concatenates tokens from every sample).
-        # Candidate evaluation intentionally does NOT pass a mask: lite_feat is
-        # stride-subsampled per layer and cannot be aligned without extra bookkeeping.
-        # Modality split inside candidate eval is second-order — it only affects
-        # which per-layer sparsity *allocation* is picked, not the final mask used
-        # when the metric is recomputed on the full input_feat.
+        # - lite_vision_mask: vision_mask_full strided identically to lite_feat so the
+        #   pruning metric (notably jsq_v5 mixture-Hessian) sees the correct modality
+        #   split during candidate evaluation.  Previously this was None, which forced
+        #   jsq_v5 to degrade to text-only H_t during search and produced a mismatch
+        #   between the metric used to pick the per-layer budget and the one applied
+        #   in the final pass.
         n_total = (
             inps.shape[0] if isinstance(inps, torch.Tensor) else len(inps)
         )
         vision_mask_flat = self._build_flat_vision_mask(vision_masks, n_use, inps)
         vision_mask_full = self._build_flat_vision_mask(vision_masks, n_total, inps)
+
+        lite_vision_mask: Optional[torch.Tensor] = None
+        if vision_mask_full is not None and lite_feat:
+            # Use any layer's full feat length as reference; all layers inside the
+            # same block share token count in the current collector.
+            ref_name = next(iter(lite_feat))
+            ref_full = input_feat.get(ref_name)
+            if isinstance(ref_full, torch.Tensor):
+                lite_vision_mask = _subsample_vision_mask(
+                    vision_mask_full,
+                    n_feat_tokens=ref_full.reshape(-1, ref_full.shape[-1]).shape[0],
+                    max_tokens=self.max_feat_tokens,
+                )
+                # Alignment guard: drop mask if length does not match lite feat.
+                if lite_vision_mask is not None and \
+                   lite_vision_mask.shape[0] != lite_feat[ref_name].shape[0]:
+                    logger.warning(
+                        "  lite_vision_mask length mismatch "
+                        f"({lite_vision_mask.shape[0]} vs "
+                        f"{lite_feat[ref_name].shape[0]}); falling back to None"
+                    )
+                    lite_vision_mask = None
 
         # ---- Step 4: generate candidates ----
         candidates = _generate_candidates(
@@ -527,7 +591,7 @@ class BlockSearcher:
             err = self._evaluate_candidate(
                 block, lite_feat, inps, layer_kwargs, config,
                 cand, Y_orig_flat, H, vision_mask_flat,
-                vision_mask_for_metric=None,
+                vision_mask_for_metric=lite_vision_mask,
             )
             logger.debug(f"  Candidate {idx}: err={err:.6e}")
             if err < best_err:
@@ -554,6 +618,95 @@ class BlockSearcher:
             if getattr(pass_, "_supports_per_layer", False):
                 pass_.apply(block, input_feat, self.adapter, config,
                             per_layer_sparsity=best_candidate,
+                            vision_mask=vision_mask_full)
+            else:
+                pass_.apply(block, input_feat, self.adapter, config)
+
+    # ------------------------------------------------------------------
+    # v5 analytic path
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _analytic_search_and_apply_v5(
+        self,
+        block: nn.Module,
+        input_feat: Dict[str, torch.Tensor],
+        layer_names: List[str],
+        layer_params: Dict[str, int],
+        config,
+        vision_masks: Optional[List[Optional[torch.Tensor]]],
+        inps,
+    ) -> None:
+        """Analytic allocation for v5: compute I per layer, then water-fill.
+
+        The inner v5 metric already gives the OBS second-order coefficient,
+        so the layer-wise expected MSE at any budget ``s_l`` is a closed-form
+        prefix-sum over the sorted I values.  No block forward pass is needed
+        and the external loss is — by construction — the same function that
+        the inner mask minimises.
+        """
+        from .passes.prune import _jsq_v5_metric
+        from .analytic_search import allocate_v5
+
+        n_total = inps.shape[0] if isinstance(inps, torch.Tensor) else len(inps)
+        vision_mask_full = self._build_flat_vision_mask(vision_masks, n_total, inps)
+
+        device = next(block.parameters()).device
+        named_linears = self.adapter.get_named_linears(block)
+
+        # ---- Compute v5 importance per layer (FP32, on device, then free) ----
+        importance_per_layer: Dict[str, torch.Tensor] = {}
+        for name in layer_names:
+            if name not in input_feat:
+                logger.warning(f"  v5 analytic: missing input_feat for '{name}'")
+                continue
+
+            feat = input_feat[name]
+            if isinstance(feat, torch.Tensor) and not feat.is_cuda:
+                feat = feat.to(device, non_blocking=True)
+
+            w = named_linears[name].weight
+            I = _jsq_v5_metric(
+                w.data, feat,
+                vision_mask=vision_mask_full,
+                pi_t=config.pi_t,
+                lambda_floor=config.lambda_floor,
+                w_bits_act=config.a_bits,
+            )
+            # Offload to CPU to keep GPU memory available for the next layer's
+            # Hessian construction (Woodbury holds an (n_t+n_v)² matrix).
+            importance_per_layer[name] = I.detach().to("cpu")
+            del I
+            torch.cuda.empty_cache()
+
+        # ---- Water-filling over the Lagrangian ----
+        allocation, predicted_err = allocate_v5(
+            importance_per_layer,
+            layer_params,
+            s_target=config.sparsity_ratio,
+        )
+        mean_s = sum(allocation[n] * layer_params[n] for n in allocation) \
+                 / max(sum(layer_params.values()), 1)
+        logger.info(
+            f"  v5 analytic: predicted ΣE={predicted_err:.4e} "
+            f"mean_s={mean_s:.4f} (target={config.sparsity_ratio:.4f})"
+        )
+        logger.debug(f"  Allocation: {allocation}")
+
+        # Free importance tensors before running passes (Prune will recompute
+        # the metric on the same feat; recomputation is cheaper than holding
+        # ~7 × [d_out, d_in] FP32 tensors in RAM).
+        del importance_per_layer
+
+        # ---- Apply passes with the analytic allocation ----
+        for name in input_feat:
+            if isinstance(input_feat[name], torch.Tensor) and not input_feat[name].is_cuda:
+                input_feat[name] = input_feat[name].to(device)
+
+        for pass_ in self.passes:
+            if getattr(pass_, "_supports_per_layer", False):
+                pass_.apply(block, input_feat, self.adapter, config,
+                            per_layer_sparsity=allocation,
                             vision_mask=vision_mask_full)
             else:
                 pass_.apply(block, input_feat, self.adapter, config)
