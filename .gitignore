@@ -9,6 +9,10 @@ __pycache__/
 # Output checkpoints
 outputs/
 
+# Experiment logs
+logs/
+*.log
+
 # Datasets & cache
 storage/
 
