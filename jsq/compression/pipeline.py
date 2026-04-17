@@ -138,6 +138,7 @@ class CompressionPipeline:
                 s_min=config.block_alloc_s_min,
                 s_max=config.block_alloc_s_max,
                 method=alloc_method,
+                invert=getattr(config, "block_alloc_invert", False),
             )
             logger.info("Per-block sparsity:\n" + summarize_allocation(per_block_sparsity))
             for li, s_l in enumerate(per_block_sparsity):

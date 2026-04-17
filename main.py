@@ -102,6 +102,8 @@ def parse_args() -> CompressConfig:
                         help="Per-block minimum sparsity clip")
     parser.add_argument("--block_alloc_s_max", type=float, default=0.7,
                         help="Per-block maximum sparsity clip")
+    parser.add_argument("--block_alloc_invert", action="store_true",
+                        help="Invert BI direction: high BI → high sparsity (prune sensitive blocks)")
 
     # Evaluation
     parser.add_argument("--eval_only", action="store_true",
@@ -159,6 +161,7 @@ def parse_args() -> CompressConfig:
         block_alloc_alpha=args.block_alloc_alpha,
         block_alloc_s_min=args.block_alloc_s_min,
         block_alloc_s_max=args.block_alloc_s_max,
+        block_alloc_invert=args.block_alloc_invert,
         eval_ppl=args.eval_ppl,
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,

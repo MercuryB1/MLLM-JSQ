@@ -1,13 +1,17 @@
 """Per-block multimodal sensitivity allocator for JSQ v5 Option E.
 
 Computes modality-split Block Influence (BI) for every decoder block, then
-allocates non-uniform sparsity so that blocks with higher mixed sensitivity
-receive lower sparsity.
+allocates non-uniform sparsity based on mixed sensitivity.
 
 Design (symmetric to the element-level mixture-H metric):
 
     S_l  = pi_t * BI_t[l] + pi_v * BI_v[l]             (block score)
-    raw  = 1 / (S_l ** alpha + eps)                    (allocation weight)
+
+    invert=False (protect sensitive):
+        raw  = 1 / (S_l ** alpha + eps)    → high BI → low sparsity
+    invert=True  (prune sensitive):
+        raw  = S_l ** alpha + eps          → high BI → high sparsity
+
     s_l  = s_target * raw_l / mean(raw) , then clip + rescale to preserve budget.
 
 Where BI_t / BI_v are computed from per-token cosine distance:
@@ -88,6 +92,7 @@ def allocate_per_block_sparsity(
     s_min: float = 0.1,
     s_max: float = 0.7,
     method: str = "bi_mixture",
+    invert: bool = False,
     eps: float = 1e-6,
     max_iters: int = 20,
 ) -> List[float]:
@@ -100,6 +105,7 @@ def allocate_per_block_sparsity(
         alpha: inverse-sensitivity exponent (higher = more aggressive spread).
         s_min, s_max: per-block clip range.
         method: "bi_mixture" | "bi_text" | "bi_vision".
+        invert: if True, high BI → high sparsity (prune sensitive blocks).
 
     Returns:
         list of length L; mean(result) ≈ target.
@@ -127,7 +133,10 @@ def allocate_per_block_sparsity(
 
     import numpy as np
     s_arr = np.asarray(scores, dtype=np.float64)
-    raw = 1.0 / (np.power(s_arr, alpha) + eps)  # high sensitivity → small weight
+    if invert:
+        raw = np.power(s_arr, alpha) + eps       # high sensitivity → high sparsity
+    else:
+        raw = 1.0 / (np.power(s_arr, alpha) + eps)  # high sensitivity → low sparsity
 
     # Initial allocation proportional to raw, mean = target
     alloc = raw / raw.mean() * target
@@ -156,7 +165,7 @@ def allocate_per_block_sparsity(
     logger.info(
         f"Block sparsity alloc: target={target:.3f} realized={realized:.3f} "
         f"min={float(alloc.min()):.3f} max={float(alloc.max()):.3f} "
-        f"method={method} alpha={alpha}"
+        f"method={method} alpha={alpha} invert={invert}"
     )
     return [float(x) for x in alloc]
 
