@@ -170,6 +170,70 @@ def allocate_per_block_sparsity(
     return [float(x) for x in alloc]
 
 
+def allocate_from_scores(
+    scores: List[float],
+    *,
+    target: float,
+    alpha: float = 1.0,
+    s_min: float = 0.1,
+    s_max: float = 0.7,
+    invert: bool = False,
+    eps: float = 1e-6,
+    max_iters: int = 20,
+) -> List[float]:
+    """Allocate per-block sparsity from a single score vector (e.g. pruning damage).
+
+    Args:
+        scores: per-block scalar sensitivity (higher = more sensitive).
+        target: global target sparsity (mean over blocks).
+        alpha: exponent controlling spread.
+        s_min, s_max: per-block clip range.
+        invert: if False, high score → low sparsity (protect sensitive).
+                if True, high score → high sparsity (prune sensitive).
+
+    Returns:
+        list of length L; mean(result) ≈ target.
+    """
+    if not (0.0 < target < 1.0):
+        raise ValueError(f"target sparsity out of range: {target}")
+
+    import numpy as np
+    s_arr = np.asarray(scores, dtype=np.float64)
+    if invert:
+        raw = np.power(s_arr, alpha) + eps
+    else:
+        raw = 1.0 / (np.power(s_arr, alpha) + eps)
+
+    alloc = raw / raw.mean() * target
+
+    L = len(alloc)
+    for _ in range(max_iters):
+        clipped_low = alloc < s_min
+        clipped_high = alloc > s_max
+        alloc = np.clip(alloc, s_min, s_max)
+        fixed_mass = alloc[clipped_low].sum() + alloc[clipped_high].sum()
+        free_mask = ~(clipped_low | clipped_high)
+        n_free = int(free_mask.sum())
+        if n_free == 0:
+            break
+        free_target_mass = target * L - fixed_mass
+        current_free_mass = alloc[free_mask].sum()
+        if current_free_mass < 1e-9 or abs(current_free_mass - free_target_mass) < 1e-6:
+            break
+        alloc[free_mask] *= free_target_mass / current_free_mass
+        if (alloc[free_mask] >= s_min - 1e-9).all() and (alloc[free_mask] <= s_max + 1e-9).all():
+            alloc = np.clip(alloc, s_min, s_max)
+            break
+
+    realized = float(alloc.mean())
+    logger.info(
+        f"Block sparsity alloc (from scores): target={target:.3f} realized={realized:.3f} "
+        f"min={float(alloc.min()):.3f} max={float(alloc.max()):.3f} "
+        f"alpha={alpha} invert={invert}"
+    )
+    return [float(x) for x in alloc]
+
+
 def summarize_allocation(alloc: List[float], scores: Optional[List[float]] = None) -> str:
     """Human-readable summary for logging."""
     import numpy as np

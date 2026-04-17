@@ -14,12 +14,14 @@ from tqdm import tqdm
 
 from .block_search import BlockSearcher
 from .block_vl_allocator import (
+    allocate_from_scores,
     allocate_per_block_sparsity,
     summarize_allocation,
 )
 from .collector import (
     collect_block_input_feat,
     collect_block_input_feat_and_output,
+    collect_block_pruning_damage,
     collect_block_sensitivity,
     collect_first_layer_inputs,
     run_block,
@@ -116,7 +118,7 @@ class CompressionPipeline:
         else:
             logger.info(f"Captured inputs: {len(inps)} multimodal samples")
 
-        # Optional: per-block sparsity allocation (Option E).
+        # Optional: per-block sparsity allocation (Option E / damage).
         per_block_sparsity: Optional[List[float]] = None
         alloc_method = getattr(config, "block_alloc_method", "uniform")
         if (
@@ -124,27 +126,59 @@ class CompressionPipeline:
             and config.sparsity_ratio > 0.0
             and not use_search
         ):
-            logger.info(
-                f"Running block sensitivity pre-pass (method={alloc_method})..."
-            )
-            bi_t, bi_v = collect_block_sensitivity(
-                blocks, inps, layer_kwargs, vision_masks=vision_masks, device=device,
-            )
-            per_block_sparsity = allocate_per_block_sparsity(
-                bi_t, bi_v,
-                pi_t=config.pi_t,
-                target=config.sparsity_ratio,
-                alpha=config.block_alloc_alpha,
-                s_min=config.block_alloc_s_min,
-                s_max=config.block_alloc_s_max,
-                method=alloc_method,
-                invert=getattr(config, "block_alloc_invert", False),
-            )
-            logger.info("Per-block sparsity:\n" + summarize_allocation(per_block_sparsity))
-            for li, s_l in enumerate(per_block_sparsity):
-                logger.info(
-                    f"  block {li}: s={s_l:.3f} BI_t={bi_t[li]:.4f} BI_v={bi_v[li]:.4f}"
+            if alloc_method == "damage":
+                logger.info("Running trial-pruning damage pre-pass...")
+                # Find the PruningPass from self.passes
+                pruning_pass = None
+                for p in self.passes:
+                    if hasattr(p, "_supports_per_layer"):
+                        pruning_pass = p
+                        break
+                if pruning_pass is None:
+                    raise RuntimeError("No PruningPass found for damage estimation")
+                damage_scores = collect_block_pruning_damage(
+                    blocks, inps, layer_kwargs,
+                    pruning_pass=pruning_pass,
+                    adapter=self.adapter,
+                    config=config,
+                    vision_masks=vision_masks,
+                    device=device,
                 )
+                per_block_sparsity = allocate_from_scores(
+                    damage_scores,
+                    target=config.sparsity_ratio,
+                    alpha=config.block_alloc_alpha,
+                    s_min=config.block_alloc_s_min,
+                    s_max=config.block_alloc_s_max,
+                    invert=getattr(config, "block_alloc_invert", False),
+                )
+                logger.info("Per-block sparsity:\n" + summarize_allocation(per_block_sparsity, damage_scores))
+                for li, s_l in enumerate(per_block_sparsity):
+                    logger.info(
+                        f"  block {li}: s={s_l:.3f} damage={damage_scores[li]:.6f}"
+                    )
+            else:
+                logger.info(
+                    f"Running block sensitivity pre-pass (method={alloc_method})..."
+                )
+                bi_t, bi_v = collect_block_sensitivity(
+                    blocks, inps, layer_kwargs, vision_masks=vision_masks, device=device,
+                )
+                per_block_sparsity = allocate_per_block_sparsity(
+                    bi_t, bi_v,
+                    pi_t=config.pi_t,
+                    target=config.sparsity_ratio,
+                    alpha=config.block_alloc_alpha,
+                    s_min=config.block_alloc_s_min,
+                    s_max=config.block_alloc_s_max,
+                    method=alloc_method,
+                    invert=getattr(config, "block_alloc_invert", False),
+                )
+                logger.info("Per-block sparsity:\n" + summarize_allocation(per_block_sparsity))
+                for li, s_l in enumerate(per_block_sparsity):
+                    logger.info(
+                        f"  block {li}: s={s_l:.3f} BI_t={bi_t[li]:.4f} BI_v={bi_v[li]:.4f}"
+                    )
 
         for i, block in enumerate(tqdm(blocks, desc="Compressing blocks")):
             block.to(device)

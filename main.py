@@ -91,7 +91,7 @@ def parse_args() -> CompressConfig:
                         help="Number of per-layer sparsity configs to evaluate per block "
                              "(MA-JSQ block search)")
     parser.add_argument("--block_alloc_method", type=str, default="uniform",
-                        choices=["uniform", "bi_mixture", "bi_text", "bi_vision"],
+                        choices=["uniform", "bi_mixture", "bi_text", "bi_vision", "damage"],
                         help="Per-block sparsity allocation (Option E). "
                              "uniform = every block gets sparsity_ratio. "
                              "bi_mixture = pi_t*BI_t + pi_v*BI_v; bi_text / bi_vision = single modality.")

@@ -1,4 +1,5 @@
 """Utilities for collecting layer inputs during calibration."""
+import copy
 import functools
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
@@ -394,3 +395,118 @@ def run_block(
             return block(x, **_to_device(kw, device))[0]
         outputs = [_fwd(inp, kw) for inp, kw in zip(inps, layer_kwargs)]
         return outputs, layer_kwargs
+
+
+@torch.no_grad()
+def collect_block_pruning_damage(
+    blocks: List[nn.Module],
+    inps,
+    layer_kwargs,
+    pruning_pass,
+    adapter,
+    config,
+    vision_masks: Optional[List] = None,
+    device: Optional[torch.device] = None,
+) -> List[float]:
+    """Measure per-block reconstruction error from trial pruning.
+
+    For each block:
+      1. Forward clean inputs → y_clean
+      2. Collect input features (for pruning metric computation)
+      3. Save weight copies, apply trial pruning at target sparsity
+      4. Forward pruned block → y_pruned
+      5. damage[l] = MSE(y_clean, y_pruned) summed over all samples
+      6. Restore original weights
+
+    Uses y_clean as input to the next block (propagates clean signal).
+
+    Returns:
+        damage: list of length len(blocks), one float per block.
+    """
+    n_blocks = len(blocks)
+    damage: List[float] = [0.0] * n_blocks
+    is_multimodal = not isinstance(inps, torch.Tensor)
+    current = inps
+
+    # Build flat vision mask builder (same logic as pipeline)
+    def _flat_vmask(cur_inps):
+        if vision_masks is None or not isinstance(cur_inps, list):
+            return None
+        parts = []
+        for idx, inp in enumerate(cur_inps):
+            n_tok = inp.reshape(-1, inp.shape[-1]).shape[0]
+            m = vision_masks[idx] if idx < len(vision_masks) else None
+            if m is None or m.shape[0] != n_tok:
+                parts.append(torch.zeros(n_tok, dtype=torch.bool))
+            else:
+                parts.append(m.bool())
+        flat = torch.cat(parts, dim=0)
+        return flat if flat.any() else None
+
+    for li, block in enumerate(blocks):
+        tgt_dev = device if device is not None else next(block.parameters()).device
+        block.to(tgt_dev)
+
+        # Step 1: forward clean → y_clean, and collect input features
+        input_feat, y_clean_inps, _ = collect_block_input_feat_and_output(
+            block, current, layer_kwargs
+        )
+
+        # Step 2: save original weights
+        saved_weights = {}
+        named_linears = adapter.get_named_linears(block)
+        for name, linear in named_linears.items():
+            saved_weights[name] = linear.weight.data.clone()
+
+        # Step 3: apply trial pruning at target sparsity
+        flat_vm = _flat_vmask(current)
+        kw = {}
+        if hasattr(pruning_pass, "_supports_per_layer"):
+            kw["vision_mask"] = flat_vm
+        pruning_pass.apply(block, input_feat, adapter, config, **kw)
+
+        # Step 4: forward pruned → y_pruned
+        if is_multimodal:
+            mse_total = 0.0
+            for inp, kw_s in zip(current, layer_kwargs):
+                x = inp.to(tgt_dev)
+                if x.dim() == 2:
+                    x = x.unsqueeze(0)
+                y_pruned = block(x, **_to_device(kw_s, tgt_dev))[0]
+                # Find corresponding y_clean
+                idx = 0
+                for j, ci in enumerate(current):
+                    if ci is inp:
+                        idx = j
+                        break
+                y_c = y_clean_inps[idx]
+                if isinstance(y_c, torch.Tensor):
+                    y_c = y_c.to(tgt_dev)
+                mse_total += float((y_pruned.float() - y_c.float()).pow(2).mean())
+            damage[li] = mse_total / max(len(current), 1)
+        else:
+            batch_size = current.shape[0]
+            mse_total = 0.0
+            for i in range(batch_size):
+                inp_i = current[i: i + 1].to(tgt_dev)
+                kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
+                kw_i["past_key_values"] = None
+                kw_i["use_cache"] = False
+                y_pruned = block(inp_i, **_to_device(kw_i, tgt_dev))[0]
+                y_c = y_clean_inps[i: i + 1].to(tgt_dev)
+                mse_total += float((y_pruned.float() - y_c.float()).pow(2).mean())
+            damage[li] = mse_total / max(batch_size, 1)
+
+        # Step 5: restore original weights
+        for name, linear in named_linears.items():
+            linear.weight.data.copy_(saved_weights[name])
+
+        logger.info(f"block {li}: pruning_damage={damage[li]:.6f}")
+
+        # Propagate clean signal to next block
+        current = y_clean_inps
+        del input_feat, saved_weights
+        block.cpu()
+        torch.cuda.empty_cache()
+
+    return damage
