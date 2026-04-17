@@ -407,18 +407,24 @@ def collect_block_pruning_damage(
     config,
     vision_masks: Optional[List] = None,
     device: Optional[torch.device] = None,
+    sequential: bool = False,
 ) -> List[float]:
     """Measure per-block reconstruction error from trial pruning.
 
     For each block:
-      1. Forward clean inputs → y_clean
+      1. Forward current inputs through clean block → y_clean
       2. Collect input features (for pruning metric computation)
       3. Save weight copies, apply trial pruning at target sparsity
-      4. Forward pruned block → y_pruned
-      5. damage[l] = MSE(y_clean, y_pruned) summed over all samples
+      4. Forward current inputs through pruned block → y_pruned
+      5. damage[l] = MSE(y_clean, y_pruned)
       6. Restore original weights
 
-    Uses y_clean as input to the next block (propagates clean signal).
+    Args:
+        sequential: if False (default), propagate y_clean to next block
+            (independent per-block damage). If True, propagate y_pruned
+            to next block (sequential damage — captures cascading errors
+            from earlier blocks being pruned). Weights are always restored
+            after measurement; only the signal propagation differs.
 
     Returns:
         damage: list of length len(blocks), one float per block.
@@ -428,7 +434,6 @@ def collect_block_pruning_damage(
     is_multimodal = not isinstance(inps, torch.Tensor)
     current = inps
 
-    # Build flat vision mask builder (same logic as pipeline)
     def _flat_vmask(cur_inps):
         if vision_masks is None or not isinstance(cur_inps, list):
             return None
@@ -465,28 +470,25 @@ def collect_block_pruning_damage(
             kw["vision_mask"] = flat_vm
         pruning_pass.apply(block, input_feat, adapter, config, **kw)
 
-        # Step 4: forward pruned → y_pruned
+        # Step 4: forward pruned → y_pruned and compute damage
         if is_multimodal:
             mse_total = 0.0
-            for inp, kw_s in zip(current, layer_kwargs):
+            y_pruned_list: List[torch.Tensor] = []
+            for s_idx, (inp, kw_s) in enumerate(zip(current, layer_kwargs)):
                 x = inp.to(tgt_dev)
                 if x.dim() == 2:
                     x = x.unsqueeze(0)
                 y_pruned = block(x, **_to_device(kw_s, tgt_dev))[0]
-                # Find corresponding y_clean
-                idx = 0
-                for j, ci in enumerate(current):
-                    if ci is inp:
-                        idx = j
-                        break
-                y_c = y_clean_inps[idx]
+                y_c = y_clean_inps[s_idx]
                 if isinstance(y_c, torch.Tensor):
                     y_c = y_c.to(tgt_dev)
                 mse_total += float((y_pruned.float() - y_c.float()).pow(2).mean())
+                y_pruned_list.append(y_pruned.detach())
             damage[li] = mse_total / max(len(current), 1)
         else:
             batch_size = current.shape[0]
             mse_total = 0.0
+            y_pruned_parts: List[torch.Tensor] = []
             for i in range(batch_size):
                 inp_i = current[i: i + 1].to(tgt_dev)
                 kw_i = _slice_kw_for_sample(layer_kwargs, i, batch_size)
@@ -495,6 +497,7 @@ def collect_block_pruning_damage(
                 y_pruned = block(inp_i, **_to_device(kw_i, tgt_dev))[0]
                 y_c = y_clean_inps[i: i + 1].to(tgt_dev)
                 mse_total += float((y_pruned.float() - y_c.float()).pow(2).mean())
+                y_pruned_parts.append(y_pruned.detach().cpu())
             damage[li] = mse_total / max(batch_size, 1)
 
         # Step 5: restore original weights
@@ -503,8 +506,15 @@ def collect_block_pruning_damage(
 
         logger.info(f"block {li}: pruning_damage={damage[li]:.6f}")
 
-        # Propagate clean signal to next block
-        current = y_clean_inps
+        # Propagate: sequential uses pruned outputs, independent uses clean
+        if sequential:
+            if is_multimodal:
+                current = y_pruned_list
+            else:
+                current = torch.cat(y_pruned_parts, dim=0)
+        else:
+            current = y_clean_inps
+
         del input_feat, saved_weights
         block.cpu()
         torch.cuda.empty_cache()

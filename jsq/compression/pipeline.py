@@ -136,6 +136,8 @@ class CompressionPipeline:
                         break
                 if pruning_pass is None:
                     raise RuntimeError("No PruningPass found for damage estimation")
+                use_seq = getattr(config, "block_alloc_seq", False)
+                logger.info(f"  sequential={use_seq}")
                 damage_scores = collect_block_pruning_damage(
                     blocks, inps, layer_kwargs,
                     pruning_pass=pruning_pass,
@@ -143,6 +145,7 @@ class CompressionPipeline:
                     config=config,
                     vision_masks=vision_masks,
                     device=device,
+                    sequential=use_seq,
                 )
                 per_block_sparsity = allocate_from_scores(
                     damage_scores,
