@@ -104,6 +104,8 @@ def parse_args() -> CompressConfig:
                         help="Per-block maximum sparsity clip")
     parser.add_argument("--block_alloc_invert", action="store_true",
                         help="Invert BI direction: high BI → high sparsity (prune sensitive blocks)")
+    parser.add_argument("--block_alloc_log", action="store_true",
+                        help="Log-transform damage scores before allocation (compress extreme ranges)")
 
     # Evaluation
     parser.add_argument("--eval_only", action="store_true",
@@ -162,6 +164,7 @@ def parse_args() -> CompressConfig:
         block_alloc_s_min=args.block_alloc_s_min,
         block_alloc_s_max=args.block_alloc_s_max,
         block_alloc_invert=args.block_alloc_invert,
+        block_alloc_log=getattr(args, 'block_alloc_log', False),
         eval_ppl=args.eval_ppl,
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,

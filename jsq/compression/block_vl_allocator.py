@@ -178,6 +178,7 @@ def allocate_from_scores(
     s_min: float = 0.1,
     s_max: float = 0.7,
     invert: bool = False,
+    log_transform: bool = False,
     eps: float = 1e-6,
     max_iters: int = 20,
 ) -> List[float]:
@@ -190,6 +191,8 @@ def allocate_from_scores(
         s_min, s_max: per-block clip range.
         invert: if False, high score → low sparsity (protect sensitive).
                 if True, high score → high sparsity (prune sensitive).
+        log_transform: if True, apply log(score + eps) before power transform.
+                       Compresses extreme ranges (e.g. 2000x → 8x).
 
     Returns:
         list of length L; mean(result) ≈ target.
@@ -199,6 +202,9 @@ def allocate_from_scores(
 
     import numpy as np
     s_arr = np.asarray(scores, dtype=np.float64)
+    if log_transform:
+        s_arr = np.log(s_arr + eps)
+        s_arr = s_arr - s_arr.min() + 1.0  # shift so minimum = 1.0
     if invert:
         raw = np.power(s_arr, alpha) + eps
     else:
@@ -229,7 +235,7 @@ def allocate_from_scores(
     logger.info(
         f"Block sparsity alloc (from scores): target={target:.3f} realized={realized:.3f} "
         f"min={float(alloc.min()):.3f} max={float(alloc.max()):.3f} "
-        f"alpha={alpha} invert={invert}"
+        f"alpha={alpha} invert={invert} log_transform={log_transform}"
     )
     return [float(x) for x in alloc]
 

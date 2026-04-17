@@ -56,6 +56,7 @@ class CompressConfig:
     block_alloc_s_min: float = 0.1         # per-block sparsity clip (low)
     block_alloc_s_max: float = 0.7         # per-block sparsity clip (high)
     block_alloc_invert: bool = False       # True = high BI → high sparsity
+    block_alloc_log: bool = False          # True = log-transform scores before allocation
 
     # Other
     save_dir: Optional[str] = None
