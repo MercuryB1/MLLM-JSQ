@@ -427,6 +427,7 @@ class BlockSearcher:
         H: torch.Tensor,
         vision_mask_flat: Optional[torch.Tensor],
         vision_mask_for_metric: Optional[torch.Tensor] = None,
+        block_pi_t: Optional[float] = None,
     ) -> float:
         device = next(block.parameters()).device
         block_copy = copy.deepcopy(block).to(device)
@@ -435,7 +436,8 @@ class BlockSearcher:
                 if getattr(pass_, "_supports_per_layer", False):
                     pass_.apply(block_copy, lite_feat, self.adapter, config,
                                 per_layer_sparsity=per_layer_sparsity,
-                                vision_mask=vision_mask_for_metric)
+                                vision_mask=vision_mask_for_metric,
+                                block_pi_t=block_pi_t)
                 else:
                     pass_.apply(block_copy, lite_feat, self.adapter, config)
 
@@ -465,6 +467,7 @@ class BlockSearcher:
         config,
         Y_orig,                                          # unused (see note)
         vision_masks: Optional[List[Optional[torch.Tensor]]] = None,
+        block_pi_t: Optional[float] = None,
     ) -> None:
         """Search for the best per-layer sparsity config and apply it in-place.
 
@@ -485,7 +488,10 @@ class BlockSearcher:
         # Fast path: no pruning search needed
         if config.sparsity_ratio == 0.0 and config.prune_n == 0:
             for pass_ in self.passes:
-                pass_.apply(block, input_feat, self.adapter, config)
+                if getattr(pass_, "_supports_per_layer", False):
+                    pass_.apply(block, input_feat, self.adapter, config, block_pi_t=block_pi_t)
+                else:
+                    pass_.apply(block, input_feat, self.adapter, config)
             return
 
         named_linears = self.adapter.get_named_linears(block)
@@ -499,7 +505,7 @@ class BlockSearcher:
         if config.pruning_method == "jsq_v5":
             self._analytic_search_and_apply_v5(
                 block, input_feat, layer_names, layer_params,
-                config, vision_masks, inps,
+                config, vision_masks, inps, block_pi_t=block_pi_t,
             )
             return
 
@@ -592,6 +598,7 @@ class BlockSearcher:
                 block, lite_feat, inps, layer_kwargs, config,
                 cand, Y_orig_flat, H, vision_mask_flat,
                 vision_mask_for_metric=lite_vision_mask,
+                block_pi_t=block_pi_t,
             )
             logger.debug(f"  Candidate {idx}: err={err:.6e}")
             if err < best_err:
@@ -618,7 +625,8 @@ class BlockSearcher:
             if getattr(pass_, "_supports_per_layer", False):
                 pass_.apply(block, input_feat, self.adapter, config,
                             per_layer_sparsity=best_candidate,
-                            vision_mask=vision_mask_full)
+                            vision_mask=vision_mask_full,
+                            block_pi_t=block_pi_t)
             else:
                 pass_.apply(block, input_feat, self.adapter, config)
 
@@ -636,6 +644,7 @@ class BlockSearcher:
         config,
         vision_masks: Optional[List[Optional[torch.Tensor]]],
         inps,
+        block_pi_t: Optional[float] = None,
     ) -> None:
         """Analytic allocation for v5: compute I per layer, then water-fill.
 
@@ -669,7 +678,7 @@ class BlockSearcher:
             I = _jsq_v5_metric(
                 w.data, feat,
                 vision_mask=vision_mask_full,
-                pi_t=config.pi_t,
+                pi_t=config.pi_t if block_pi_t is None else block_pi_t,
                 lambda_floor=config.lambda_floor,
                 w_bits_act=config.a_bits,
             )
@@ -707,6 +716,7 @@ class BlockSearcher:
             if getattr(pass_, "_supports_per_layer", False):
                 pass_.apply(block, input_feat, self.adapter, config,
                             per_layer_sparsity=allocation,
-                            vision_mask=vision_mask_full)
+                            vision_mask=vision_mask_full,
+                            block_pi_t=block_pi_t)
             else:
                 pass_.apply(block, input_feat, self.adapter, config)

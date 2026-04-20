@@ -64,6 +64,20 @@ def parse_args() -> CompressConfig:
                         help="JSQ v5: text mixture weight in H (pi_v = 1 - pi_t)")
     parser.add_argument("--lambda_floor", type=float, default=1e-3,
                         help="JSQ v5: minimum regularizer in H = pi_t C_t + pi_v C_v + lam I")
+    parser.add_argument("--block_pi_method", type=str, default="none",
+                        choices=["none", "dominance", "conflict_weighted"],
+                        help="JSQ v5 block-wise adaptive mixture: estimate a per-block pi_t "
+                             "from text-only vs vision-only importance statistics")
+    parser.add_argument("--block_pi_blend", type=float, default=1.0,
+                        help="Blend factor between global pi_t and the estimated block-wise pi_t "
+                             "(0 = keep global pi_t, 1 = pure block estimate)")
+    parser.add_argument("--block_pi_min", type=float, default=0.1,
+                        help="Lower clip bound for block-wise pi_t")
+    parser.add_argument("--block_pi_max", type=float, default=0.9,
+                        help="Upper clip bound for block-wise pi_t")
+    parser.add_argument("--block_pi_max_tokens", type=int, default=1024,
+                        help="Token cap used when estimating block-wise pi_t "
+                             "(smaller than pruning-time max_tokens for speed)")
 
     # Quantization
     parser.add_argument("--w_bits", type=int, default=8)
@@ -152,6 +166,11 @@ def parse_args() -> CompressConfig:
         top_k=args.top_k,
         pi_t=args.pi_t,
         lambda_floor=args.lambda_floor,
+        block_pi_method=args.block_pi_method,
+        block_pi_blend=args.block_pi_blend,
+        block_pi_min=args.block_pi_min,
+        block_pi_max=args.block_pi_max,
+        block_pi_max_tokens=args.block_pi_max_tokens,
         w_bits=args.w_bits,
         a_bits=args.a_bits,
         weight_quant=args.weight_quant,

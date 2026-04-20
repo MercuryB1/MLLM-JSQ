@@ -13,6 +13,7 @@ from loguru import logger
 from tqdm import tqdm
 
 from .block_search import BlockSearcher
+from .block_pi import estimate_block_pi
 from .block_vl_allocator import (
     allocate_from_scores,
     allocate_per_block_sparsity,
@@ -192,6 +193,17 @@ class CompressionPipeline:
                 input_feat, next_inps, layer_kwargs = collect_block_input_feat_and_output(
                     block, inps, layer_kwargs
                 )
+                flat_vmask = self._build_flat_vision_mask(vision_masks, inps)
+                block_pi_t, block_pi_stats = estimate_block_pi(
+                    block, input_feat, self.adapter, config, vision_mask=flat_vmask
+                )
+                if block_pi_t is not None:
+                    logger.info(
+                        f"Block {i}: block_pi_t={block_pi_t:.3f} "
+                        f"dominance={block_pi_stats.get('dominance', 0.0):.3f} "
+                        f"conflict={block_pi_stats.get('conflict', 0.0):.3f} "
+                        f"iou={block_pi_stats.get('mask_iou', 1.0):.3f}"
+                    )
                 logger.info(f"Block {i}: running block search ({config.search_method})")
                 searcher.search_and_apply(
                     block=block,
@@ -201,12 +213,23 @@ class CompressionPipeline:
                     config=config,
                     Y_orig=next_inps,
                     vision_masks=vision_masks,
+                    block_pi_t=block_pi_t,
                 )
             else:
                 # Direct mode: collect feat, apply passes, then forward
                 input_feat = collect_block_input_feat(block, inps, layer_kwargs)
                 # Build flat vision mask for modality-aware pruning (v4)
                 flat_vmask = self._build_flat_vision_mask(vision_masks, inps)
+                block_pi_t, block_pi_stats = estimate_block_pi(
+                    block, input_feat, self.adapter, config, vision_mask=flat_vmask
+                )
+                if block_pi_t is not None:
+                    logger.info(
+                        f"Block {i}: block_pi_t={block_pi_t:.3f} "
+                        f"dominance={block_pi_stats.get('dominance', 0.0):.3f} "
+                        f"conflict={block_pi_stats.get('conflict', 0.0):.3f} "
+                        f"iou={block_pi_stats.get('mask_iou', 1.0):.3f}"
+                    )
                 # Optional per-block sparsity override (Option E)
                 block_sparsity_dict: Optional[dict] = None
                 if per_block_sparsity is not None:
@@ -217,6 +240,8 @@ class CompressionPipeline:
                     kw = {}
                     if hasattr(pass_, "_supports_per_layer"):
                         kw["vision_mask"] = flat_vmask
+                        if block_pi_t is not None:
+                            kw["block_pi_t"] = block_pi_t
                         if block_sparsity_dict is not None:
                             kw["per_layer_sparsity"] = block_sparsity_dict
                     pass_.apply(block, input_feat, self.adapter, config, **kw)

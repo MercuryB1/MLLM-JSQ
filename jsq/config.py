@@ -25,6 +25,12 @@ class CompressConfig:
     # JSQ v5: mixture-Hessian OBS metric
     pi_t: float = 0.5           # text mixture weight; pi_v = 1 - pi_t
     lambda_floor: float = 1e-3  # minimum regularizer in H = pi_t H_t + pi_v H_v + lam I
+    # JSQ v5 block-wise adaptive mixture (Innovation 2 experimental branch)
+    block_pi_method: str = "none"    # none / dominance / conflict_weighted
+    block_pi_blend: float = 1.0      # 0 = keep global pi_t, 1 = use pure block estimate
+    block_pi_min: float = 0.1        # clip range for per-block pi_t
+    block_pi_max: float = 0.9
+    block_pi_max_tokens: int = 1024  # cheaper token cap for block-level pi_t estimation
 
     # Quantization
     w_bits: int = 8

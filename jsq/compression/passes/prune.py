@@ -436,6 +436,17 @@ def _jsq_v2_metric(
 def _apply_mask(w: torch.Tensor, metric: torch.Tensor, sparsity_ratio: float,
                 prune_n: int, prune_m: int) -> None:
     """Apply pruning mask to w in-place."""
+    mask = _compute_mask(metric, sparsity_ratio, prune_n, prune_m)
+    w[mask] = 0.0
+
+
+def _compute_mask(
+    metric: torch.Tensor,
+    sparsity_ratio: float,
+    prune_n: int,
+    prune_m: int,
+) -> torch.Tensor:
+    """Return the boolean pruning mask without modifying the weight tensor."""
     if prune_n != 0:
         mask = torch.zeros_like(metric, dtype=torch.bool)
         for i in range(0, metric.shape[1], prune_m):
@@ -447,8 +458,7 @@ def _apply_mask(w: torch.Tensor, metric: torch.Tensor, sparsity_ratio: float,
         k = int(metric.shape[1] * sparsity_ratio)
         mask = torch.zeros_like(metric, dtype=torch.bool)
         mask.scatter_(1, sorted_idx[:, :k], True)
-
-    w[mask] = 0.0
+    return mask
 
 
 
@@ -472,6 +482,7 @@ class PruningPass(CompressionPass):
         config,
         per_layer_sparsity: Optional[Dict[str, float]] = None,
         vision_mask: Optional[torch.Tensor] = None,
+        block_pi_t: Optional[float] = None,
     ) -> None:
         if config.sparsity_ratio == 0.0 and config.prune_n == 0 and not per_layer_sparsity:
             return
@@ -534,7 +545,7 @@ class PruningPass(CompressionPass):
                 metric = _jsq_v5_metric(
                     w.data, feat,
                     vision_mask=vision_mask,
-                    pi_t=config.pi_t,
+                    pi_t=config.pi_t if block_pi_t is None else block_pi_t,
                     lambda_floor=config.lambda_floor,
                     w_bits_act=config.a_bits,
                 )
