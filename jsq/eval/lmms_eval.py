@@ -3,11 +3,49 @@
 This module wraps a compressed MLLM so it can be evaluated by the
 lmms-eval framework (https://github.com/EvolvingLMMs-Lab/lmms-eval).
 """
+import sys
 from typing import Dict, List, Optional
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 from loguru import logger
+
+
+def _prefer_vendored_lmms_eval() -> None:
+    """Force imports to resolve to the repo's vendored lmms-eval copy.
+
+    The upstream package ships many task templates without a `.yaml` suffix.
+    Those files are present in `third_party/lmms-eval`, but are dropped from
+    some wheel installs because package-data only includes `*.yaml|*.yml`.
+    Prepending the vendored source tree avoids FileNotFoundError at eval time.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    vendor_root = repo_root / "third_party" / "lmms-eval"
+    vendor_pkg = vendor_root / "lmms_eval" / "__init__.py"
+    if not vendor_pkg.is_file():
+        return
+
+    vendor_root_str = str(vendor_root)
+    if vendor_root_str not in sys.path:
+        sys.path.insert(0, vendor_root_str)
+
+    loaded = sys.modules.get("lmms_eval")
+    loaded_file = getattr(loaded, "__file__", None) if loaded is not None else None
+    if loaded_file is None:
+        return
+
+    loaded_path = Path(loaded_file).resolve()
+    try:
+        loaded_path.relative_to(vendor_root.resolve())
+        return
+    except ValueError:
+        pass
+
+    for name in list(sys.modules):
+        if name == "lmms_eval" or name.startswith("lmms_eval."):
+            sys.modules.pop(name, None)
+    logger.info(f"Using vendored lmms-eval from {vendor_root}")
 
 
 def run_lmms_eval(
@@ -19,6 +57,7 @@ def run_lmms_eval(
     limit: Optional[int] = None,
 ) -> Dict:
     """Run lmms-eval benchmarks on a compressed MLLM."""
+    _prefer_vendored_lmms_eval()
     try:
         from lmms_eval import evaluator
     except ImportError:
