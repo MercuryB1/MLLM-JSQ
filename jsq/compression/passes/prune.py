@@ -1,10 +1,14 @@
-"""Pruning pass: JSQ v1/v2/v3/v4, WANDA, and Magnitude."""
+"""Pruning pass: JSQ v1/v2/v3/v4/v5, WANDA, and Magnitude."""
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 from loguru import logger
 
+from ...quant.ops import (
+    quantize_weight_per_channel_absmax,
+    quantize_weight_per_tensor_absmax,
+)
 from .base import CompressionPass
 
 
@@ -280,8 +284,7 @@ def _jsq_v4_metric(
     return base
 
 
-def _jsq_v5_metric(
-    w: torch.Tensor,
+def compute_jsq_v5_hinv_diag(
     inp: torch.Tensor,
     vision_mask: Optional[torch.Tensor] = None,
     pi_t: float = 0.5,
@@ -289,34 +292,10 @@ def _jsq_v5_metric(
     max_tokens: int = 4096,
     w_bits_act: int = 8,
 ) -> torch.Tensor:
-    """JSQ v5: mixture-Hessian OBS importance.
-
-    I(i, j) = W_ij^2 / [H^-1]_jj,
-    H = pi_t * X_t^T X_t + pi_v * X_v^T X_v + lam * I.
-
-    lam absorbs per-token activation quantization variance (sigma_A^2) plus a
-    small Ledoit-Wolf shrinkage, both estimated on the fly from X. No explicit
-    OBS compensation is applied; downstream Smooth/Clip/Quantize passes run
-    as usual.
-
-    Text-only mode (vision_mask None or all-one-modality) degenerates to
-    single-H SparseGPT-style scoring.
-
-    Args:
-        w: [cout, cin] weight.
-        inp: activations, 2D [tokens, cin] or 3D [nsamples, seq, cin].
-        vision_mask: [tokens] bool, True = vision. None => all text.
-        pi_t: text mixture weight; pi_v = 1 - pi_t.
-        lambda_floor: minimum regularizer (numerical stability).
-        max_tokens: per-modality token cap for Hessian construction.
-        w_bits_act: activation bitwidth used to estimate sigma_A^2.
-
-    Returns:
-        metric: [cout, cin] importance score (higher = more important).
-    """
+    """Compute diag(H^-1) for the JSQ v5 mixture-Hessian."""
     from ..hessian_utils import mixture_hinv_diag, estimate_lam
 
-    act = inp.reshape(-1, inp.shape[-1]).float().to(w.device)
+    act = inp.reshape(-1, inp.shape[-1]).float()
     n_tok = act.shape[0]
 
     if vision_mask is not None and vision_mask.numel() == n_tok:
@@ -350,8 +329,88 @@ def _jsq_v5_metric(
         x_t=x_t, x_v=x_v,
         pi_t=pi_t_eff, pi_v=pi_v_eff, lam=lam,
         max_rows=max_tokens,
-        device=w.device, dtype=torch.float32,
+        device=act.device, dtype=torch.float32,
     )  # [cin]
+    return hinv_diag
+
+
+def compute_jsq_v5_zero_bit_metric(
+    w: torch.Tensor,
+    inp: torch.Tensor,
+    vision_mask: Optional[torch.Tensor] = None,
+    pi_t: float = 0.5,
+    lambda_floor: float = 1e-3,
+    max_tokens: int = 4096,
+    w_bits_act: int = 8,
+    w_bits: int = 8,
+    weight_quant: str = "per_channel",
+    joint: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Return JSQ v5 zero-bit quantities for prune-vs-W8 decisions.
+
+    The two candidate actions for a weight are:
+      - prune:  a = 0       -> d0 = w^2 / diag(H^-1)
+      - keep:   a = Q8(w)   -> d8 = (w - q)^2 / diag(H^-1)
+
+    ``utility = d0 - d8`` is the gain of keeping the weight as W8 instead of
+    pruning it to zero.  When ``joint=False``, ``utility`` degenerates to ``d0``.
+    """
+    hinv_diag = compute_jsq_v5_hinv_diag(
+        inp=inp,
+        vision_mask=vision_mask,
+        pi_t=pi_t,
+        lambda_floor=lambda_floor,
+        max_tokens=max_tokens,
+        w_bits_act=w_bits_act,
+    ).to(w.device)
+
+    denom = hinv_diag.unsqueeze(0).clamp(min=1e-12)
+    w_f = w.float()
+    d0 = w_f.pow(2) / denom
+
+    if not joint:
+        return {
+            "hinv_diag": hinv_diag,
+            "d0": d0,
+            "utility": d0,
+        }
+
+    q_w = w_f.clone()
+    if weight_quant == "per_channel":
+        q_w = quantize_weight_per_channel_absmax(q_w, w_bits=w_bits)
+    elif weight_quant == "per_tensor":
+        q_w = quantize_weight_per_tensor_absmax(q_w, w_bits=w_bits)
+    else:
+        raise ValueError(f"Unknown weight_quant: {weight_quant}")
+
+    d8 = (w_f - q_w).pow(2) / denom
+    utility = d0 - d8
+    return {
+        "hinv_diag": hinv_diag,
+        "d0": d0,
+        "d8": d8,
+        "utility": utility,
+    }
+
+
+def _jsq_v5_metric(
+    w: torch.Tensor,
+    inp: torch.Tensor,
+    vision_mask: Optional[torch.Tensor] = None,
+    pi_t: float = 0.5,
+    lambda_floor: float = 1e-3,
+    max_tokens: int = 4096,
+    w_bits_act: int = 8,
+) -> torch.Tensor:
+    """JSQ v5: mixture-Hessian OBS importance."""
+    hinv_diag = compute_jsq_v5_hinv_diag(
+        inp=inp,
+        vision_mask=vision_mask,
+        pi_t=pi_t,
+        lambda_floor=lambda_floor,
+        max_tokens=max_tokens,
+        w_bits_act=w_bits_act,
+    ).to(w.device)
 
     # I(i, j) = W_ij^2 / [H^-1]_jj. Keep in fp32 to avoid fp16 overflow on
     # large W^2 / small hinv_diag; downstream _apply_mask only needs ordering.
@@ -487,6 +546,7 @@ class PruningPass(CompressionPass):
         if config.sparsity_ratio == 0.0 and config.prune_n == 0 and not per_layer_sparsity:
             return
 
+        layer_alloc_method = getattr(config, "layer_alloc_method", "uniform")
         named_linears = adapter.get_named_linears(block)
 
         for name, linear in named_linears.items():
@@ -542,13 +602,26 @@ class PruningPass(CompressionPass):
                     w_bits=config.w_bits,
                 )
             elif config.pruning_method == "jsq_v5":
-                metric = _jsq_v5_metric(
-                    w.data, feat,
-                    vision_mask=vision_mask,
-                    pi_t=config.pi_t if block_pi_t is None else block_pi_t,
-                    lambda_floor=config.lambda_floor,
-                    w_bits_act=config.a_bits,
-                )
+                if layer_alloc_method == "zero_bit_joint":
+                    metric = compute_jsq_v5_zero_bit_metric(
+                        w.data,
+                        feat,
+                        vision_mask=vision_mask,
+                        pi_t=config.pi_t if block_pi_t is None else block_pi_t,
+                        lambda_floor=config.lambda_floor,
+                        w_bits_act=config.a_bits,
+                        w_bits=config.w_bits,
+                        weight_quant=config.weight_quant,
+                        joint=True,
+                    )["utility"]
+                else:
+                    metric = _jsq_v5_metric(
+                        w.data, feat,
+                        vision_mask=vision_mask,
+                        pi_t=config.pi_t if block_pi_t is None else block_pi_t,
+                        lambda_floor=config.lambda_floor,
+                        w_bits_act=config.a_bits,
+                    )
             else:
                 raise ValueError(f"Unknown pruning_method: {config.pruning_method}")
 

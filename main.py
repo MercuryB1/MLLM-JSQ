@@ -122,6 +122,12 @@ def parse_args() -> CompressConfig:
                         help="Log-transform damage scores before allocation (compress extreme ranges)")
     parser.add_argument("--block_alloc_seq", action="store_true",
                         help="Sequential damage estimation: propagate pruned outputs between blocks")
+    parser.add_argument("--layer_alloc_method", type=str, default="uniform",
+                        choices=["uniform", "zero_bit_d0", "zero_bit_joint"],
+                        help="JSQ v5 direct mode: derive per-layer sparsity inside each block "
+                             "from the same mixture-Hessian objective. "
+                             "zero_bit_d0 = prune-loss only; "
+                             "zero_bit_joint = prune(0-bit) vs keep(W8) utility.")
 
     # Evaluation
     parser.add_argument("--eval_only", action="store_true",
@@ -187,6 +193,7 @@ def parse_args() -> CompressConfig:
         block_alloc_invert=args.block_alloc_invert,
         block_alloc_log=getattr(args, 'block_alloc_log', False),
         block_alloc_seq=getattr(args, 'block_alloc_seq', False),
+        layer_alloc_method=args.layer_alloc_method,
         eval_ppl=args.eval_ppl,
         tasks=args.tasks,
         num_fewshot=args.num_fewshot,

@@ -28,6 +28,7 @@ from .collector import (
     run_block,
 )
 from .passes.base import CompressionPass
+from .zero_bit_allocator import allocate_zero_bit_layer_sparsity
 
 
 class CompressionPipeline:
@@ -122,6 +123,16 @@ class CompressionPipeline:
         # Optional: per-block sparsity allocation (Option E / damage).
         per_block_sparsity: Optional[List[float]] = None
         alloc_method = getattr(config, "block_alloc_method", "uniform")
+        layer_alloc_method = getattr(config, "layer_alloc_method", "uniform")
+        if layer_alloc_method != "uniform":
+            if use_search:
+                raise ValueError("layer_alloc_method requires search_method=none")
+            if alloc_method != "uniform":
+                raise ValueError("layer_alloc_method cannot be combined with block_alloc_method")
+            if config.pruning_method != "jsq_v5":
+                raise ValueError("layer_alloc_method currently requires pruning_method=jsq_v5")
+            if config.prune_n != 0 or config.prune_m != 0:
+                raise ValueError("layer_alloc_method currently requires unstructured pruning")
         if (
             alloc_method != "uniform"
             and config.sparsity_ratio > 0.0
@@ -236,13 +247,43 @@ class CompressionPipeline:
                     s_l = per_block_sparsity[i]
                     linears = self.adapter.get_named_linears(block)
                     block_sparsity_dict = {name: s_l for name in linears}
+                layer_sparsity_dict: Optional[dict] = None
+                if (
+                    layer_alloc_method != "uniform"
+                    and config.sparsity_ratio > 0.0
+                ):
+                    layer_sparsity_dict, layer_alloc_stats = allocate_zero_bit_layer_sparsity(
+                        block,
+                        input_feat,
+                        self.adapter,
+                        config,
+                        target_sparsity=config.sparsity_ratio,
+                        vision_mask=flat_vmask,
+                        block_pi_t=block_pi_t,
+                        method=layer_alloc_method,
+                    )
+                    logger.info(
+                        f"Block {i}: zero-bit alloc ({layer_alloc_method}) "
+                        f"target_keep={int(layer_alloc_stats['target_keep'])} "
+                        f"realized_keep={int(layer_alloc_stats['realized_keep'])} "
+                        f"pred_err={layer_alloc_stats['predicted_error']:.4e}"
+                    )
+                    for name, st in layer_alloc_stats["layers"].items():
+                        logger.info(
+                            f"  {name}: s={st['sparsity']:.3f} "
+                            f"keep_per_row={int(st['keep_per_row'])} "
+                            f"base0={st['base0']:.4e} "
+                            f"pred_err={st['pred_err']:.4e}"
+                        )
                 for pass_ in self.passes:
                     kw = {}
                     if hasattr(pass_, "_supports_per_layer"):
                         kw["vision_mask"] = flat_vmask
                         if block_pi_t is not None:
                             kw["block_pi_t"] = block_pi_t
-                        if block_sparsity_dict is not None:
+                        if layer_sparsity_dict is not None:
+                            kw["per_layer_sparsity"] = layer_sparsity_dict
+                        elif block_sparsity_dict is not None:
                             kw["per_layer_sparsity"] = block_sparsity_dict
                     pass_.apply(block, input_feat, self.adapter, config, **kw)
                 next_inps, layer_kwargs = run_block(block, inps, layer_kwargs)

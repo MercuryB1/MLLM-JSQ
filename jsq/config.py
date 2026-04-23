@@ -64,6 +64,10 @@ class CompressConfig:
     block_alloc_invert: bool = False       # True = high BI → high sparsity
     block_alloc_log: bool = False          # True = log-transform scores before allocation
     block_alloc_seq: bool = False          # True = sequential damage (propagate pruned signal)
+    # JSQ v5 Zero-Bit allocation: solve per-layer sparsity inside each block
+    # from the same mixture-Hessian distortion. "zero_bit_d0" uses pure pruning
+    # loss; "zero_bit_joint" models keep-as-W8 vs prune-as-0bit utility.
+    layer_alloc_method: str = "uniform"    # uniform / zero_bit_d0 / zero_bit_joint
 
     # Other
     save_dir: Optional[str] = None
