@@ -514,6 +514,7 @@ block 内所有投影层 (q/k/v/o/gate/up/down) 共享 $s_l$，用 v5 per-elemen
 ## 8. 文档索引
 
 - `plan/jsq_v5_mixture_hessian.md` — v5 原始 plan（§1-§13）
+- `plan/jsq_v5_zero_bit_allocation.md` — v5 第二贡献设计：Zero-Bit Rate-Distortion Allocation
 - `plan/exp_v5_sweep_20260414.md` — A/B/C/D sweep 结果与 F1-F9 findings
 - `plan/exp_v5_next_steps_20260414.md` — 优先级清单（updated 2026-04-15）
 - `plan/jsq_v5_progress_20260416.md` — **本文件（最新进展总结）**
